@@ -1,0 +1,30 @@
+[
+  {
+    "dialogue_id": "locomo-mini-1",
+    "participants": ["Andrew", "Audrey"],
+    "turns": [
+      {
+        "speaker": "Andrew",
+        "text": "I adopted a dog named Buddy from the shelter.",
+        "timestamp": "2023-01-01 20:00"
+      },
+      {
+        "speaker": "Audrey",
+        "text": "That's great. What's the dog's name again?",
+        "timestamp": "2023-01-01 20:10"
+      },
+      {
+        "speaker": "Andrew",
+        "text": "Buddy. Later I adopted another dog named Scout.",
+        "timestamp": "2023-03-05 11:00"
+      }
+    ],
+    "questions": [
+      {
+        "question": "How many dogs did Andrew adopt?",
+        "answer": "2",
+        "turn_index": 2
+      }
+    ]
+  }
+]

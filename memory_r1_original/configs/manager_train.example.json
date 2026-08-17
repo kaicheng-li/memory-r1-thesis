@@ -1,0 +1,16 @@
+{
+  "manager_model_name_or_path": "Qwen/Qwen2.5-3B-Instruct",
+  "answer_model_name_or_path": "Qwen/Qwen2.5-3B-Instruct",
+  "train_file": "data/manager_train.jsonl",
+  "output_dir": "outputs/memory_manager",
+  "algorithm": "ppo",
+  "batch_size": 1,
+  "epochs": 1,
+  "learning_rate": 1e-6,
+  "critic_learning_rate": 1e-5,
+  "max_prompt_tokens": 4096,
+  "max_new_tokens": 256,
+  "num_generations": 4,
+  "beta": 0.02,
+  "temperature": 1.0
+}
