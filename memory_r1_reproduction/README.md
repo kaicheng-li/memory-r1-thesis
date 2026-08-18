@@ -19,12 +19,12 @@ memory_r1_reproduction/
 
 ## Scripts
 
-- `scripts/train_memfactory_memr1.py`: MemFactory Memory-R1 GRPO trainer.
-- `scripts/run_memfactory_memr1.sh`: MemFactory launch configuration.
+- `scripts/train_mem_grpo.py`: MemFactory GRPO trainer.
+- `scripts/run_MemR1.sh`: MemFactory launch configuration.
 - `scripts/convert_locomo_to_memfactory_memr1.py`: LoCoMo to MemFactory converter.
-- `scripts/build_memory_r1_manager_data.py`: standalone manager data builder.
+- `scripts/build_manager_training_data.py`: Algorithm 1 Manager data builder.
+- `scripts/build_answer_training_data.py`: Algorithm 2 Answer data builder; requires a trained Manager checkpoint.
 - `scripts/train_memory_r1_manager.py`: standalone manager trainer.
-- `scripts/build_memory_r1_answer_data.py`: standalone answer data builder.
 - `scripts/train_memory_r1_answer.py`: standalone answer trainer.
 
 The source directories `memfactory_upstream` and `memory_r1_original` are not

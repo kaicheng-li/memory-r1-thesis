@@ -6,54 +6,90 @@ from ..common.registry import MODULE_REGISTRY
 from ..common.utils import parse_json_from_text
 from .base import BaseModule, Samples
 
-UPDATE_MEMORY_PROMPT = """You are a smart memory manager.
-You have two lists of memories:
-1. **Existing Memories** (from the database).
-2. **New Candidate Memories** (extracted from the latest conversation).
+UPDATE_MEMORY_PROMPT = """You are a smart memory manager which controls the memory of a system.
+You can perform four operations: (1) add into the memory, (2) update the
+memory, (3) delete from the memory, and (4) no change.
+Based on the above four operations, the memory will change.
+Compare newly retrieved facts with the existing memory. For each new fact,
+decide whether to:- ADD: Add it to the memory as a new element- UPDATE: Update an existing memory element- DELETE: Delete an existing memory element- NONE: Make no change (if the fact is already present or irrelevant)
+1. **Add**: If the retrieved facts contain new information not present
+in the memory, then you have to add it by generating a new ID in the id field.- Example:
+Old Memory:
+[
+{"id" : "0", "text" : "User is a software engineer"}
+]
+Retrieved facts: ["Name is John"]
+New Memory:
+{
+"memory" : [
+{"id" : "0", "text" : "User is a software engineer", "event" : "NONE"},
+{"id" : "1", "text" : "Name is John", "event" : "ADD"}
+]
+}
+2. **Update**: If the retrieved facts contain information that is already
+present in the memory but the information is totally different, then
+you have to update it.
+If the retrieved fact contains information that conveys the same thing as
+the memory, keep the version with more detail.
+Example (a)– if the memory contains "User likes to play cricket" and the
+retrieved fact is "Loves to play cricket with friends", then update the
+memory with the retrieved fact.
+Example (b)– if the memory contains "Likes cheese pizza" and the
+retrieved fact is "Loves cheese pizza", then do NOT update it because they
+convey the same information.
+Important: When updating, keep the same ID and preserve old_memory.- Example:
+Old Memory:
+[
+{"id" : "0", "text" : "I really like cheese pizza"},
+{"id" : "2", "text" : "User likes to play cricket"}
+]
+Retrieved facts: ["Loves chicken pizza", "Loves to play cricket with friends"]
+New Memory:
+{
+"memory" : [
+{"id" : "0", "text" : "Loves cheese and chicken pizza", "event" : "UPDATE",
+"old_memory" : "I really like cheese pizza"},
+{"id" : "2", "text" : "Loves to play cricket with friends", "event" : "UPDATE",
+"old_memory" : "User likes to play cricket"}
+]
+}
+3. **Delete**: If the retrieved facts contain information that contradicts
+the memory, delete it. When deleting, return the same IDs — do not generate new IDs.- Example:
+Old Memory:
+[
+{"id" : "1", "text" : "Loves cheese pizza"}
+]
+Retrieved facts: ["Dislikes cheese pizza"]
+New Memory:
+{
+"memory" : [
+{"id" : "1", "text" : "Loves cheese pizza", "event" : "DELETE"}
+]
+}
+4. **No Change**: If the retrieved facts are already present, make no change.- Example:
+Old Memory:
+[
+{"id" : "0", "text" : "Name is John"}
+]
+Retrieved facts: ["Name is John"]
+New Memory:
+{
+"memory" : [
+{"id" : "0", "text" : "Name is John", "event" : "NONE"}
+]
+}"""
 
-Your goal is to decide how to update the memory database.
 
-**Operations Allowed:**
-
-For **Existing Memories**:
-- `NONE`: Keep as is.
-- `DEL`: Delete this memory (e.g., if it is contradicted by new info, or merged into a new memory).
-
-For **New Candidate Memories**:
-- `ADD`: Add this memory to the database.
-- `NONE`: Ignore this memory (e.g., if it's redundant or already covered by existing memories).
-- `UPDATE`: Modify this memory before adding (e.g., to merge information from an old memory).
-
-**Merging Strategy:**
-If a New Candidate (ID: Y) contains updated information for an Existing Memory (ID: X):
-1. Mark Existing Memory X as `DEL`.
-2. Mark New Candidate Y as `UPDATE` and provide the merged content.
-
-**Output Format:**
-Return a JSON object with a list of operations.
-You MUST include an operation for **EVERY** memory item (both Existing and Candidate) in the input lists. Do not skip any IDs.
-
-Format:
-```json
-{{
-  "operations": [
-    {{ "id": <id>, "op": "NONE" }},
-    {{ "id": <id>, "op": "DEL" }},
-    {{ "id": <id>, "op": "ADD" }},
-    {{ "id": <id>, "op": "UPDATE", "key": "...", "value": "..." }}
-  ]
-}}
-```
-
-**Task:**
-
-Existing Memories:
-{context_memory}
-
-New Candidate Memories:
-{candidate_memory}
-
-Output:"""
+def build_manager_input(old_memory: List[Dict[str, Any]], retrieved_facts: List[Any]) -> str:
+    """Attach runtime memory and facts to the canonical Manager prompt."""
+    return (
+        f"{UPDATE_MEMORY_PROMPT}\n\n"
+        "Old Memory:\n"
+        f"{json.dumps(old_memory, ensure_ascii=False, indent=2)}\n\n"
+        "Retrieved facts:\n"
+        f"{json.dumps(retrieved_facts, ensure_ascii=False, indent=2)}\n\n"
+        "Return only the JSON object with the key \"memory\"."
+    )
 
 @MODULE_REGISTRY.register("naive_updater")
 class NaiveUpdater(BaseModule):

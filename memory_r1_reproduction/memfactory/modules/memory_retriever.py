@@ -6,19 +6,62 @@ from .base import BaseModule
 from ..common.utils import parse_json_from_text
 from ..envs.memory_bank_utils import MemoryItem, generate_id
 
-RERANK_PROMPT = """You are an expert memory retriever.
-Your task is to select the most relevant memories to answer the user's query.
+RERANK_PROMPT = """You are an intelligent memory assistant tasked with retrieving
+accurate information from conversation memories.
+# CONTEXT:
+You have access to memories from two speakers in a conversation.
+These memories contain timestamped information that may be relevant
+to answering the question.
+# INSTRUCTIONS:
+1. Carefully analyze all provided memories from both speakers
+2. Pay special attention to the timestamps to determine the answer
+3. If the question asks about a specific event or fact, look for direct evidence
+4. If the memories contain contradictory information, prioritize the most recent memory
+5. If there is a question about time references (like "last year", "two months ago"),
+calculate the actual date based on the memory timestamp.
+6. Always convert relative time references to specific dates, months, or years.
+7. Focus only on the content of the memories. Do not confuse character names
+8. The answer should be less than 5-6 words.
+9. IMPORTANT: Select memories you found that are useful for answering the questions,
+and output it before you answer questions.
+10. IMPORTANT: Output the final answer after **Answer:**
+# APPROACH (Think step by step):
+1. Examine all relevant memories
+2. Examine the timestamps carefully
+3. Look for explicit mentions that answer the question
+4. Convert relative references if needed
+5. Formulate a concise answer
+6. Double-check the answer correctness
+7. Ensure the final answer is specific
+8. First output the memories that you found are important before you answer questions
+Memories for user John:- 7:20 pm on 16 June, 2023: John has a special memory of a vacation to California where he experienced a
+gorgeous sunset and an enjoyable night strolling the shore, creating meaningful memories with loved ones.- 6:13 pm on 10 April, 2023: John explored the coast in the Pacific Northwest and visited some national
+parks, finding the beauty of nature absolutely breathtaking.- 3:14 pm on 13 August, 2023: John enjoys spending time outdoors with his family, including activities
+such as hiking, hanging out at the park, and having picnics. He also values indoor family activities like
+playing board games and having movie nights at home.
+... (In total 30 most relevant memories from John's Memory Bank are provided) ...
+Memories for user Maria:- 6:29 pm on 7 July, 2023: John experienced a severe flood in his old area last week, which caused
+significant damage to homes due to poor infrastructure.- 1:24 pm on 25 May, 2023: Maria appreciates the beauty of small, meaningful moments in life, as reflected
+in her reaction to a family beach photo shared by John.- 3:14 pm on 13 August, 2023: Maria appreciates family bonding and is interested in the activities that
+John and his family enjoy doing together.
+... (In total 30 most relevant memories from Maria's Memory Bank are provided) ...
+Question: Does John live close to a beach or the mountains?"""
 
-User Query: {query}
 
-Candidate Memories:
-{candidates}
-
-Select the exact IDs of the most useful memories (max 8 items). Provide your reasoning in <think> tags, then output a JSON list of the selected IDs.
-Example output:
-<think> memory 1 is relevant because... </think>
-[1, 3, 4]
-"""
+def build_answer_input(question: str, memories_by_speaker: Dict[str, List[Dict[str, Any]]]) -> str:
+    """Attach runtime retrieved memories to the canonical Answer prompt."""
+    sections = []
+    for speaker, memories in memories_by_speaker.items():
+        sections.append(
+            f"Memories for user {speaker}:\n"
+            f"{json.dumps(memories, ensure_ascii=False, indent=2)}\n"
+            f"... (In total {len(memories)} relevant memories from {speaker}'s Memory Bank are provided) ..."
+        )
+    return (
+        f"{RERANK_PROMPT}\n\n"
+        + "\n\n".join(sections)
+        + f"\n\nQuestion: {question}\n"
+    )
 
 @MODULE_REGISTRY.register("naive_retriever")
 class NaiveRetriever(BaseModule):
