@@ -1,8 +1,9 @@
 """Build Memory Manager training tuples directly from raw LoCoMo JSON.
 
 For every turn t, GPT-4o-mini summarizes the preceding 50 turns into a
-temporal memory bank. The output row contains the bank, the current turn, and
-QA pairs linked to that turn. It contains no memory-operation labels.
+temporal memory bank. The output row contains the bank, the window turns
+(preceding 50 + the current turn, replayed by Algorithm 5), the current turn,
+and QA pairs linked to that turn. It contains no memory-operation labels.
 """
 
 from __future__ import annotations
@@ -211,12 +212,19 @@ def build(input_path: str, output_path: str, cache_path: str, model: str) -> Non
                 for question in dialogue.get("questions", [])
                 if int(question["turn_index"]) == turn_index
             ]
+            window_turns = []
+            for window_index in range(start, turn_index + 1):
+                window_turn = dict(turns[window_index])
+                window_turn["turn_index"] = window_index
+                window_turns.append(window_turn)
+
             rows.append(
                 {
                     "dialogue_id": dialogue_id,
                     "turn_index": turn_index,
                     "participants": dialogue.get("participants", []),
                     "temporal_memory_bank": memory_bank,
+                    "dialogue_turns": window_turns,
                     "current_turn": current_turn,
                     "linked_questions": linked_questions,
                     "metadata": {

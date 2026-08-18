@@ -90,7 +90,7 @@ def generate_completions(
     temperature: float,
     device: str,
 ) -> list[str]:
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+    inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt", truncation=True).to(device)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,

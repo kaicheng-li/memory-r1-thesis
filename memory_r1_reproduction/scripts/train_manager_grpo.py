@@ -1,13 +1,15 @@
 """Algorithm 5: train the Memory Manager with a fixed Answer Agent.
 
 Primary data path: Algorithm 1 tuples (build_manager_training_data.py output).
-Each tuple is (temporal_memory_bank, current_turn, linked_questions): the
-manager starts from the temporal bank built by the teacher, processes the
-current turn, and the frozen Answer Agent answers the linked questions with
-the updated bank — the exact-match reward is the training signal.
+Each tuple is (dialogue_turns, temporal_memory_bank, current_turn,
+linked_questions). Per tuple the manager starts from an empty bank (M <- {})
+and replays every turn of the tuple's dialogue window; the frozen Answer Agent
+then answers the linked questions with the resulting bank — the exact-match
+reward on its answers is the training signal. The teacher-built temporal bank
+is consumed by the Answer Agent data builder (Algorithm 2), not by this loop.
 
-Fallback data path: raw LoCoMo JSON, in which case the full dialogue is
-rolled out from an empty bank before answering (simplified variant).
+Fallback data path: raw LoCoMo JSON, in which case the whole dialogue is the
+tuple and is rolled out from an empty bank the same way.
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ def is_tuple_data(rows: list[dict[str, Any]]) -> bool:
 
 
 def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Algorithm 1 rows -> (temporal_memory_bank, current_turn, linked_questions)."""
+    """Algorithm 1 rows -> (dialogue_turns, temporal_memory_bank, current_turn, linked_questions)."""
     tuples = []
     for row in rows:
         if not isinstance(row, dict):
@@ -65,11 +67,17 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(current_turn, dict):
             continue
         bank = row.get("temporal_memory_bank", [])
+        dialogue_turns = [
+            turn
+            for turn in row.get("dialogue_turns", [])
+            if isinstance(turn, dict) and str(turn.get("text", "")).strip()
+        ]
         tuples.append(
             {
                 "dialogue_id": str(row.get("dialogue_id", "dialogue")),
                 "turn_index": int(row.get("turn_index", 0)),
                 "temporal_memory_bank": bank if isinstance(bank, list) else [],
+                "dialogue_turns": dialogue_turns or [current_turn],
                 "current_turn": current_turn,
                 "linked_questions": [
                     question
@@ -251,7 +259,7 @@ class TextModel:
         self.trainable = trainable
 
     def generate(self, prompt: str, max_new_tokens: int, temperature: float) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        inputs = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt", truncation=True).to(self.device)
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -265,10 +273,16 @@ class TextModel:
         return self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
 
     def log_probability(self, prompt: str, completion: str) -> torch.Tensor:
+        """Token-level log probabilities over the completion region, shape [L'].
+
+        Uses the same tokenization (add_special_tokens=False) as generate(),
+        so the importance ratios are computed under the actual sampling
+        distribution.
+        """
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
         completion_ids = self.tokenizer(completion, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
         if completion_ids.numel() == 0:
-            return torch.zeros((), device=self.device)
+            return torch.zeros((0,), device=self.device)
         input_ids = torch.cat([prompt_ids, completion_ids]).unsqueeze(0).to(self.device)
         attention_mask = torch.ones_like(input_ids)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -277,7 +291,7 @@ class TextModel:
         start = max(prompt_ids.numel() - 1, 0)
         completion_logits = logits[:, start : start + completion_ids.numel(), :]
         completion_labels = labels[:, start : start + completion_ids.numel()]
-        return F.log_softmax(completion_logits, dim=-1).gather(2, completion_labels.unsqueeze(-1)).squeeze(-1).sum()
+        return F.log_softmax(completion_logits, dim=-1).gather(2, completion_labels.unsqueeze(-1)).squeeze(-1)
 
 
 def answer_with_model(answer_model: TextModel, question: str, memories: list[dict[str, Any]], max_new_tokens: int) -> str:
@@ -303,17 +317,24 @@ def apply_policy_update(
     action_losses = []
     for trajectory, advantage in zip(trajectories, advantages):
         for prompt, completion, old_log_prob in trajectory["actions"]:
-            current_log_prob = manager.log_probability(prompt, completion)
+            token_log_probs = manager.log_probability(prompt, completion)  # [L']
+            if token_log_probs.numel() == 0:
+                continue
+            current_log_prob = token_log_probs.sum()
+            ratio = torch.exp(current_log_prob - old_log_prob)
             if args.algorithm == "ppo":
-                ratio = torch.exp(current_log_prob - old_log_prob)
                 clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
                 action_losses.append(-torch.minimum(ratio * advantage, clipped * advantage))
             else:
                 action_losses.append(-advantage * current_log_prob)
             if reference is not None:
                 with torch.no_grad():
-                    reference_log_prob = reference.log_probability(prompt, completion)
-                action_losses[-1] = action_losses[-1] + args.beta * (current_log_prob - reference_log_prob)
+                    reference_log_probs = reference.log_probability(prompt, completion)
+                if reference_log_probs.numel() == 0:
+                    continue
+                log_ratio = reference_log_probs - token_log_probs
+                # R1-style KL penalty k3(u) = e^u - u - 1 (u = log ref - log act), >= 0
+                action_losses[-1] = action_losses[-1] + args.beta * (log_ratio.exp() - 1 - log_ratio).mean()
     if not action_losses:
         return float("nan")
     loss = torch.stack(action_losses).mean()
@@ -329,99 +350,117 @@ def apply_policy_update(
 # ---------------------------------------------------------------------------
 
 def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples) -> None:
-    """Algorithm 5 over Algorithm 1 tuples: per-turn episodes."""
-    for epoch in range(args.epochs):
-        progress = tqdm(tuples, desc=f"memory-manager-{args.algorithm}-epoch-{epoch + 1}")
-        for item in progress:
-            questions = item["linked_questions"]
-            if not questions:
+    """Algorithm 5 over Algorithm 1 tuples.
+
+    Per tuple: M <- {}; replay every turn of the tuple's dialogue window
+    (extract -> retrieve -> manager op -> apply); then answer the linked
+    questions with the frozen Answer Agent over the resulting bank. One
+    GRPO/PPO update per tuple over its num_generations trajectories.
+    """
+    progress = tqdm(tuples, desc=f"memory-manager-{args.algorithm}")
+    for item in progress:
+        questions = item["linked_questions"]
+        if not questions:
+            continue
+        turns = item["dialogue_turns"]
+
+        trajectories = []
+        for _ in range(args.num_generations):
+            memory: list[dict[str, Any]] = []
+            actions = []
+            valid = True
+            for local_index, turn in enumerate(turns):
+                fact = {
+                    "speaker": str(turn.get("speaker", "")),
+                    "timestamp": str(turn.get("timestamp", "")),
+                    "text": str(turn.get("text", "")).strip(),
+                }
+                if not fact["text"]:
+                    continue
+                old_memory = retrieve(fact["text"], memory, args.manager_top_k)
+                prompt = build_manager_input(old_memory, [fact])
+                completion = manager.generate(prompt, args.max_new_tokens, args.temperature)
+                with torch.no_grad():
+                    old_log_prob = manager.log_probability(prompt, completion).detach().sum()
+                actions.append((prompt, completion, old_log_prob))
+                try:
+                    decisions = parse_manager_output(completion)
+                    apply_decisions(memory, decisions, item["dialogue_id"], int(turn.get("turn_index", local_index)), turn)
+                except Exception:
+                    valid = False
+                    break
+            trajectories.append({"memory": memory, "actions": actions, "valid": valid})
+
+        rewards = []
+        for trajectory in trajectories:
+            if not trajectory["valid"] or not trajectory["actions"]:
+                rewards.append(0.0)
                 continue
-            turn = item["current_turn"]
+            question_rewards = []
+            for question in questions:
+                retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
+                prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens)
+                question_rewards.append(reward_fn(prediction, question["answer"]))
+            rewards.append(sum(question_rewards) / len(question_rewards))
+
+        loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
+        if math.isnan(loss):
+            continue
+        progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
+
+
+def train_from_dialogues(args, manager, reference, answer, optimizer, reward_fn, dialogues) -> None:
+    """Fallback: raw LoCoMo dialogues as whole-dialogue tuples (Algorithm 5).
+
+    Per dialogue: M <- {}; replay every turn; answer all questions of the
+    dialogue with the frozen Answer Agent; one update per dialogue.
+    """
+    progress = tqdm(dialogues, desc=f"memory-manager-{args.algorithm}")
+    for dialogue in progress:
+        questions = [item for item in dialogue.get("questions", []) if item.get("question")]
+        if not questions:
+            continue
+
+        trajectories = [{"memory": [], "actions": [], "valid": True} for _ in range(args.num_generations)]
+        for turn_index, turn in enumerate(dialogue.get("turns", [])):
             fact = {
                 "speaker": str(turn.get("speaker", "")),
                 "timestamp": str(turn.get("timestamp", "")),
                 "text": str(turn.get("text", "")).strip(),
             }
-
-            trajectories = []
-            for _ in range(args.num_generations):
-                memory = [dict(memory) for memory in item["temporal_memory_bank"]]
-                actions = []
-                valid = True
-                if fact["text"]:
-                    old_memory = retrieve(fact["text"], memory, args.manager_top_k)
-                    prompt = build_manager_input(old_memory, [fact])
-                    completion = manager.generate(prompt, args.max_new_tokens, args.temperature)
-                    with torch.no_grad():
-                        old_log_prob = manager.log_probability(prompt, completion).detach()
-                    actions.append((prompt, completion, old_log_prob))
-                    try:
-                        decisions = parse_manager_output(completion)
-                        apply_decisions(memory, decisions, item["dialogue_id"], item["turn_index"], turn)
-                    except Exception:
-                        valid = False
-                trajectories.append({"memory": memory, "actions": actions, "valid": valid})
-
-            rewards = []
+            if not fact["text"]:
+                continue
             for trajectory in trajectories:
-                if not trajectory["valid"] or not trajectory["actions"]:
-                    rewards.append(0.0)
+                if not trajectory["valid"]:
                     continue
-                question_rewards = []
-                for question in questions:
-                    retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
-                    prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens)
-                    question_rewards.append(reward_fn(prediction, question["answer"]))
-                rewards.append(sum(question_rewards) / len(question_rewards))
+                old_memory = retrieve(fact["text"], trajectory["memory"], args.manager_top_k)
+                prompt = build_manager_input(old_memory, [fact])
+                completion = manager.generate(prompt, args.max_new_tokens, args.temperature)
+                with torch.no_grad():
+                    old_log_prob = manager.log_probability(prompt, completion).detach().sum()
+                trajectory["actions"].append((prompt, completion, old_log_prob))
+                try:
+                    decisions = parse_manager_output(completion)
+                    apply_decisions(trajectory["memory"], decisions, str(dialogue["dialogue_id"]), turn_index, turn)
+                except Exception:
+                    trajectory["valid"] = False
 
-            loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
-            if math.isnan(loss):
+        rewards = []
+        for trajectory in trajectories:
+            if not trajectory["valid"] or not trajectory["actions"]:
+                rewards.append(0.0)
                 continue
-            progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
-
-
-def train_from_dialogues(args, manager, reference, answer, optimizer, reward_fn, dialogues) -> None:
-    """Fallback: full-dialogue rollout from an empty bank (simplified Algorithm 5)."""
-    for epoch in range(args.epochs):
-        progress = tqdm(dialogues, desc=f"memory-manager-{args.algorithm}-epoch-{epoch + 1}")
-        for dialogue in progress:
-            questions = [item for item in dialogue.get("questions", []) if item.get("question")]
-            if not questions:
-                continue
+            question_rewards = []
             for question in questions:
-                trajectories = [{"memory": [], "actions": [], "valid": True} for _ in range(args.num_generations)]
-                for turn_index, turn in enumerate(dialogue.get("turns", [])):
-                    fact = {
-                        "speaker": str(turn.get("speaker", "")),
-                        "timestamp": str(turn.get("timestamp", "")),
-                        "text": str(turn.get("text", "")).strip(),
-                    }
-                    if not fact["text"]:
-                        continue
-                    for trajectory in trajectories:
-                        old_memory = retrieve(fact["text"], trajectory["memory"], args.manager_top_k)
-                        prompt = build_manager_input(old_memory, [fact])
-                        completion = manager.generate(prompt, args.max_new_tokens, args.temperature)
-                        with torch.no_grad():
-                            old_log_prob = manager.log_probability(prompt, completion).detach()
-                        trajectory["actions"].append((prompt, completion, old_log_prob))
-                        try:
-                            decisions = parse_manager_output(completion)
-                            apply_decisions(trajectory["memory"], decisions, str(dialogue["dialogue_id"]), turn_index, turn)
-                        except Exception:
-                            trajectory["valid"] = False
+                retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
+                prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens)
+                question_rewards.append(reward_fn(prediction, question["answer"]))
+            rewards.append(sum(question_rewards) / len(question_rewards))
 
-                rewards = []
-                for trajectory in trajectories:
-                    retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
-                    prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens)
-                    reward = reward_fn(prediction, question["answer"]) if trajectory["valid"] else 0.0
-                    rewards.append(reward)
-
-                loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
-                if math.isnan(loss):
-                    continue
-                progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
+        loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
+        if math.isnan(loss):
+            continue
+        progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
 
 
 def save_checkpoint(manager: TextModel, output_dir: Path, epoch: int) -> None:
@@ -443,7 +482,7 @@ def train(args: argparse.Namespace) -> None:
 
     rows = read_rows(args.data_path)
     if is_tuple_data(rows):
-        print("Algorithm 1 tuple data detected; training per-turn episodes...")
+        print("Algorithm 1 tuple data detected; replaying dialogue windows per tuple...")
         tuples = normalize_tuples(rows)
         for epoch in range(args.epochs):
             train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples)
