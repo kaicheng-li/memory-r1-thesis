@@ -182,8 +182,7 @@ def apply_manager_output(memory_bank: list[dict[str, Any]], output: str, dialogu
                 continue
             memory = {
                 "id": f"{dialogue_id}:m{next_id}",
-                "speaker": str(decision.get("speaker", "Unknown")),
-                "text": text,
+                    "text": text,
                 "timestamp": str(decision.get("timestamp", "")),
                 "source_turn": turn_index,
             }
@@ -192,7 +191,6 @@ def apply_manager_output(memory_bank: list[dict[str, Any]], output: str, dialogu
             by_id[memory["id"]] = memory
         elif event == "UPDATE" and memory_id in by_id and text:
             by_id[memory_id]["text"] = text
-            by_id[memory_id]["speaker"] = str(decision.get("speaker", by_id[memory_id].get("speaker", "Unknown")))
             by_id[memory_id]["source_turn"] = turn_index
         elif event == "DELETE" and memory_id in by_id:
             memory_bank.remove(by_id[memory_id])
@@ -206,19 +204,8 @@ def word_score(question: str, memory: dict[str, Any]) -> float:
     return len(question_tokens & memory_tokens) / denominator if denominator else 0.0
 
 
-def retrieve_for_each_participant(
-    question: str,
-    memory_bank: list[dict[str, Any]],
-    participants: list[str],
-) -> list[dict[str, Any]]:
-    retrieved = []
-    if not participants:
-        participants = sorted({str(memory.get("speaker", "Unknown")) for memory in memory_bank})
-    for participant in participants:
-        candidates = [memory for memory in memory_bank if memory.get("speaker") == participant]
-        candidates.sort(key=lambda memory: word_score(question, memory), reverse=True)
-        retrieved.extend(candidates[:TOP_K_PER_PARTICIPANT])
-    return retrieved
+def retrieve_memories(question: str, memory_bank: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(memory_bank, key=lambda memory: word_score(question, memory), reverse=True)[:TOP_K]
 
 
 def build(input_path: str, output_path: str, manager_path: str, device: str, max_new_tokens: int) -> None:
@@ -228,7 +215,6 @@ def build(input_path: str, output_path: str, manager_path: str, device: str, max
 
     for dialogue in dialogues:
         dialogue_id = str(dialogue["dialogue_id"])
-        participants = [str(participant) for participant in dialogue.get("participants", [])]
         memory_bank: list[dict[str, Any]] = []
 
         for turn_index, current_turn in enumerate(dialogue.get("turns", [])):
@@ -236,7 +222,7 @@ def build(input_path: str, output_path: str, manager_path: str, device: str, max
             apply_manager_output(memory_bank, output, dialogue_id, turn_index)
 
         for question_index, question in enumerate(dialogue.get("questions", [])):
-            candidates = retrieve_for_each_participant(question["question"], memory_bank, participants)
+            candidates = retrieve_memories(question["question"], memory_bank)
             rows.append(
                 {
                     "dialogue_id": dialogue_id,
@@ -246,7 +232,7 @@ def build(input_path: str, output_path: str, manager_path: str, device: str, max
                     "answer": question["answer"],
                     "metadata": {
                         "manager_model": manager_path,
-                        "top_k_per_participant": TOP_K_PER_PARTICIPANT,
+                        "top_k": TOP_K,
                         "retrieved_count": len(candidates),
                     },
                 }
