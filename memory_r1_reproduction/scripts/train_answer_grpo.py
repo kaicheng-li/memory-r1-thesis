@@ -89,7 +89,12 @@ def generate_completions(
     max_new_tokens: int,
     temperature: float,
     device: str,
-) -> list[str]:
+) -> list[tuple[str, torch.Tensor]]:
+    """Sample G answers; returns (decoded text, raw sampled token ids) pairs.
+
+    The token ids are kept so that score_group evaluates the exact action the
+    policy sampled, not a re-tokenized reconstruction of the decoded text.
+    """
     inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt", truncation=True).to(device)
     with torch.no_grad():
         outputs = model.generate(
@@ -103,7 +108,10 @@ def generate_completions(
         )
     prompt_length = inputs["input_ids"].shape[1]
     return [
-        tokenizer.decode(output[prompt_length:], skip_special_tokens=True).strip()
+        (
+            tokenizer.decode(output[prompt_length:], skip_special_tokens=True).strip(),
+            output[prompt_length:].clone(),
+        )
         for output in outputs
     ]
 
@@ -112,19 +120,19 @@ def score_group(
     model,
     tokenizer,
     prompt: str,
-    completions: list[str],
+    completion_ids: list[torch.Tensor],
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Token-level log probabilities over each completion (action) region.
+    """Token-level log probabilities over the sampled completion token ids.
 
     Returns (log_probs, action_mask) shaped [G, L'] where L' is the longest
     completion length; positions outside a row's action region are masked.
     """
     prompt_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
     rows = []
-    for completion in completions:
-        completion_ids = tokenizer(completion, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
-        rows.append((completion_ids, torch.cat([prompt_ids, completion_ids])))
+    for ids in completion_ids:
+        ids = ids.to(device)
+        rows.append((ids, torch.cat([prompt_ids.to(device), ids])))
 
     max_length = max(len(ids) for _, ids in rows)
     batch_input = torch.full((len(rows), max_length), tokenizer.pad_token_id, dtype=torch.long, device=device)
@@ -149,7 +157,7 @@ def grpo_step(
     tokenizer,
     optimizer,
     prompt: str,
-    completions: list[str],
+    completion_ids: list[torch.Tensor],
     rewards: torch.Tensor,
     old_log_probs: torch.Tensor,
     args: argparse.Namespace,
@@ -158,13 +166,13 @@ def grpo_step(
     advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
     loss_value = 0.0
     for _ in range(args.num_iterations):
-        log_probs, action_mask = score_group(actor, tokenizer, prompt, completions, args.device)
+        log_probs, action_mask = score_group(actor, tokenizer, prompt, completion_ids, args.device)
         ratio = torch.exp(log_probs - old_log_probs)
         clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
         per_token = -torch.minimum(ratio * advantages.view(-1, 1), clipped * advantages.view(-1, 1))
         if reference is not None:
             with torch.no_grad():
-                reference_log_probs, _ = score_group(reference, tokenizer, prompt, completions, args.device)
+                reference_log_probs, _ = score_group(reference, tokenizer, prompt, completion_ids, args.device)
             log_ratio = reference_log_probs - log_probs
             per_token = per_token + args.beta * (log_ratio.exp() - 1 - log_ratio)
         per_token = per_token * action_mask
@@ -206,16 +214,18 @@ def train(args: argparse.Namespace) -> None:
             completions = generate_completions(
                 actor, tokenizer, prompt, args.num_generations, args.max_new_tokens, args.temperature, device
             )
+            decoded = [text for text, _ in completions]
+            completion_ids = [ids for _, ids in completions]
             rewards = torch.tensor(
-                [exact_match_reward(extract_answer(completion), sample["gold"]) for completion in completions],
+                [exact_match_reward(extract_answer(text), sample["gold"]) for text in decoded],
                 dtype=torch.float32,
                 device=device,
             )
             with torch.no_grad():
-                old_log_probs, _ = score_group(actor, tokenizer, prompt, completions, device)
+                old_log_probs, _ = score_group(actor, tokenizer, prompt, completion_ids, device)
             old_log_probs = old_log_probs.detach()
 
-            loss = grpo_step(actor, reference, tokenizer, optimizer, prompt, completions, rewards, old_log_probs, args)
+            loss = grpo_step(actor, reference, tokenizer, optimizer, prompt, completion_ids, rewards, old_log_probs, args)
             progress.set_postfix(loss=loss, reward=float(rewards.mean().item()))
 
         output_dir = Path(args.output_dir) / f"epoch_{epoch + 1}"

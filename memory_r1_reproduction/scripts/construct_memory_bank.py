@@ -15,6 +15,7 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
 
 
@@ -133,9 +134,47 @@ class Manager:
         self.model.eval()
         self.max_new_tokens = max_new_tokens
 
-    def generate(self, old_memory: list[dict[str, Any]], fact: dict[str, Any], top_k: int) -> str:
-        retrieved = top_k_fn(fact["text"], old_memory, top_k)
-        prompt = build_manager_input(retrieved, [fact])
+    def extract(self, turn: dict[str, Any]) -> list[dict[str, Any]]:
+        """LLMExtract(di) at deployment: the trained manager extracts the turn's facts."""
+        prompt = build_extract_input(turn)
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        with self.torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        prompt_length = inputs["input_ids"].shape[1]
+        raw = self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end < start:
+            return []
+        try:
+            payload = json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+        raw_facts = payload.get("memory_list", [])
+        if not isinstance(raw_facts, list):
+            return []
+        return [
+            {
+                "speaker": str(turn.get("speaker", "")),
+                "timestamp": str(turn.get("timestamp", "")),
+                "key": str(fact.get("key", "")),
+                "memory_type": str(fact.get("memory_type", "")),
+                "tags": fact.get("tags", []),
+                "text": str(fact.get("value", "")).strip(),
+            }
+            for fact in raw_facts
+            if isinstance(fact, dict) and str(fact.get("value", "")).strip()
+        ]
+
+    def generate(self, old_memory: list[dict[str, Any]], facts: list[dict[str, Any]], top_k: int) -> str:
+        query = " ".join(fact["text"] for fact in facts)
+        retrieved = top_k_fn(query, old_memory, top_k)
+        prompt = build_manager_input(retrieved, facts)
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
@@ -160,15 +199,18 @@ def construct(input_path: str, output_path: str, model_path: str, device: str, r
         dialogue_id = str(sample.get("dialogue_id", "dialogue"))
         memory_bank = []
         for turn_index, turn in enumerate(sample.get("turns", [])):
-            fact = {
-                "speaker": str(turn.get("speaker", "")),
-                "timestamp": str(turn.get("timestamp", "")),
-                "text": str(turn.get("text", "")).strip(),
-            }
-            if not fact["text"]:
+            facts = manager.extract(turn)
+            if not facts:
                 continue
-            output = manager.generate(memory_bank, fact, retrieval_top_k)
-            apply_decisions(memory_bank, parse_manager_output(output), dialogue_id, turn_index, fact["speaker"], fact["timestamp"])
+            output = manager.generate(memory_bank, facts, retrieval_top_k)
+            apply_decisions(
+                memory_bank,
+                parse_manager_output(output),
+                dialogue_id,
+                turn_index,
+                str(turn.get("speaker", "")),
+                str(turn.get("timestamp", "")),
+            )
         results.append({
             "dialogue_id": dialogue_id,
             "participants": sample.get("participants", []),

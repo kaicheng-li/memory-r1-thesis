@@ -1,9 +1,11 @@
 """Build Memory Manager training tuples directly from raw LoCoMo JSON.
 
 For every turn t, GPT-4o-mini summarizes the preceding 50 turns into a
-temporal memory bank. The output row contains the bank, the window turns
-(preceding 50 + the current turn, replayed by Algorithm 5), the current turn,
-and QA pairs linked to that turn. It contains no memory-operation labels.
+temporal memory bank and extracts the turn's key facts (LLMExtract,
+Algorithm 5 line 7). The output row contains the bank, the window turns
+(preceding 50 + the current turn, each carrying its extracted facts, replayed
+by Algorithm 5), the current turn, and QA pairs linked to that turn. It
+contains no memory-operation labels.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
 
 HISTORY_WINDOW = 50
@@ -130,11 +133,7 @@ class GPTMemoryBankBuilder:
         self.model = model
         self.cache = read_json(cache_path) if self.cache_path.exists() else {}
 
-    def build(self, dialogue_id: str, turn_index: int, previous_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        key = f"{dialogue_id}:{turn_index}"
-        if key in self.cache:
-            return self.cache[key]
-
+    def _client(self):
         try:
             from openai import OpenAI
         except ImportError as exc:
@@ -144,6 +143,66 @@ class GPTMemoryBankBuilder:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set.")
 
+        client_args = {"api_key": api_key}
+        if os.environ.get("OPENAI_BASE_URL"):
+            client_args["base_url"] = os.environ["OPENAI_BASE_URL"]
+        return OpenAI(**client_args)
+
+    def _save_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def extract_facts(self, dialogue_id: str, turn_index: int, turn: dict[str, Any]) -> list[dict[str, Any]]:
+        """LLMExtract(di): GPT-4o-mini extracts the turn's memory-relevant facts.
+
+        Extraction is deterministic per turn and cached, so Algorithm 5 can
+        consume the extracted facts across all rollout trajectories without
+        re-running the teacher.
+        """
+        key = f"facts:{dialogue_id}:{turn_index}:{self.model}"
+        if key in self.cache:
+            return self.cache[key]
+
+        client = self._client()
+        response = client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": build_extract_input(turn),
+                }
+            ],
+        )
+        payload = json.loads(response.choices[0].message.content or "{}")
+        raw_facts = payload.get("memory_list", [])
+        if not isinstance(raw_facts, list):
+            raise ValueError(f"Invalid facts returned for {dialogue_id} turn {turn_index}.")
+
+        facts = [
+            {
+                "speaker": str(turn.get("speaker", "")),
+                "timestamp": str(turn.get("timestamp", "")),
+                "key": str(fact.get("key", "")),
+                "memory_type": str(fact.get("memory_type", "")),
+                "tags": fact.get("tags", []),
+                "text": str(fact.get("value", "")).strip(),
+            }
+            for fact in raw_facts
+            if isinstance(fact, dict) and str(fact.get("value", "")).strip()
+        ]
+
+        self.cache[key] = facts
+        self._save_cache()
+        return facts
+
+    def build(self, dialogue_id: str, turn_index: int, previous_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        key = f"{dialogue_id}:{turn_index}:w{HISTORY_WINDOW}:{self.model}"
+        if key in self.cache:
+            return self.cache[key]
+
+        client = self._client()
         retrieved_facts = [
             {
                 "speaker": str(turn.get("speaker", "Unknown")),
@@ -153,10 +212,6 @@ class GPTMemoryBankBuilder:
             for turn in previous_turns
             if str(turn.get("text", "")).strip()
         ]
-        client_args = {"api_key": api_key}
-        if os.environ.get("OPENAI_BASE_URL"):
-            client_args["base_url"] = os.environ["OPENAI_BASE_URL"]
-        client = OpenAI(**client_args)
         response = client.chat.completions.create(
             model=self.model,
             temperature=0,
@@ -190,8 +245,7 @@ class GPTMemoryBankBuilder:
             )
 
         self.cache[key] = memories
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._save_cache()
         return memories
 
 
@@ -204,6 +258,12 @@ def build(input_path: str, output_path: str, cache_path: str, model: str) -> Non
         validate_questions(dialogue)
         dialogue_id = str(dialogue["dialogue_id"])
         turns = dialogue["turns"]
+        for turn_index, turn in enumerate(turns):
+            turn["facts"] = (
+                builder.extract_facts(dialogue_id, turn_index, turn)
+                if str(turn.get("text", "")).strip()
+                else []
+            )
         for turn_index, current_turn in enumerate(turns):
             start = max(0, turn_index - HISTORY_WINDOW)
             memory_bank = builder.build(dialogue_id, turn_index, turns[start:turn_index])
@@ -229,6 +289,7 @@ def build(input_path: str, output_path: str, cache_path: str, model: str) -> Non
                     "linked_questions": linked_questions,
                     "metadata": {
                         "memory_builder": model,
+                        "fact_extractor": model,
                         "history_window": HISTORY_WINDOW,
                     },
                 }

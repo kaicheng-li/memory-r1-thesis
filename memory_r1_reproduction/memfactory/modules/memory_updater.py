@@ -79,7 +79,6 @@ New Memory:
 ]
 }"""
 
-
 def build_manager_input(old_memory: List[Dict[str, Any]], retrieved_facts: List[Any]) -> str:
     """Attach runtime memory and facts to the canonical Manager prompt."""
     return (
