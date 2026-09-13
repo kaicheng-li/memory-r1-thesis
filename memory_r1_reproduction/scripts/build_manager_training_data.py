@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
 
-HISTORY_WINDOW = 50
+HISTORY_WINDOW = 24
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_MAX_RETRIES = 2
 COMPACT_JSON_INSTRUCTION = """
@@ -146,12 +146,17 @@ class NvidiaMemoryBankBuilder:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.cache = read_json(cache_path) if self.cache_path.exists() else {}
-        self._records_by_key = {}
+        self._facts_by_turn = {}
+        self._memory_banks_by_turn = {}
         for cached_key, value in self.cache.items():
-            if cached_key.startswith("facts:") or f":w{HISTORY_WINDOW}:" in cached_key:
+            if cached_key.startswith("facts:"):
                 record_key, separator, _ = cached_key.rpartition(":")
                 if separator:
-                    self._records_by_key.setdefault(record_key, value)
+                    self._facts_by_turn.setdefault(record_key, value)
+            elif ":w" in cached_key:
+                record_key, _, _ = cached_key.rpartition(":w")
+                if record_key:
+                    self._memory_banks_by_turn.setdefault(record_key, value)
         LOGGER.info(
             "teacher=%s cache=%s cached_items=%d max_tokens=%d max_retries=%d",
             model,
@@ -161,10 +166,11 @@ class NvidiaMemoryBankBuilder:
             max_retries,
         )
 
-    def _record(self, key: str) -> Any | None:
-        if key in self.cache:
-            return self.cache[key]
-        return self._records_by_key.get(key)
+    def _facts_record(self, key: str) -> Any | None:
+        return self.cache.get(key, self._facts_by_turn.get(key))
+
+    def _memory_bank_record(self, dialogue_id: str, turn_index: int, key: str) -> Any | None:
+        return self.cache.get(key, self._memory_banks_by_turn.get(f"{dialogue_id}:{turn_index}"))
 
     def _client(self):
         try:
@@ -286,7 +292,7 @@ class NvidiaMemoryBankBuilder:
         re-running the teacher.
         """
         key = f"facts:{dialogue_id}:{turn_index}"
-        record = self._record(key)
+        record = self._facts_record(key)
         if record is not None:
             LOGGER.info("cache hit: facts dialogue=%s turn=%d", dialogue_id, turn_index)
             return record
@@ -318,7 +324,7 @@ class NvidiaMemoryBankBuilder:
 
     def build(self, dialogue_id: str, turn_index: int, previous_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key = f"{dialogue_id}:{turn_index}:w{HISTORY_WINDOW}"
-        record = self._record(key)
+        record = self._memory_bank_record(dialogue_id, turn_index, key)
         if record is not None:
             LOGGER.info("cache hit: memory_bank dialogue=%s turn=%d", dialogue_id, turn_index)
             return record
