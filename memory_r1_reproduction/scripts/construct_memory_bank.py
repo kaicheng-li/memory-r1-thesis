@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -17,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve
 
 
 def read_json(path: str) -> Any:
@@ -62,61 +61,6 @@ def normalize_sample(sample: dict[str, Any]) -> dict[str, Any]:
 def load_dialogues(payload: Any) -> list[dict[str, Any]]:
     samples = payload if isinstance(payload, list) else [payload]
     return [normalize_sample(sample) for sample in samples if isinstance(sample, dict)]
-
-
-def score(query: str, memory: dict[str, Any]) -> float:
-    query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", str(memory.get("text", "")).lower()))
-    denominator = math.sqrt(len(query_tokens) * len(memory_tokens))
-    return len(query_tokens & memory_tokens) / denominator if denominator else 0.0
-
-
-def top_k(query: str, memory_bank: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: score(query, memory), reverse=True)[:k]
-
-
-def parse_manager_output(text: str) -> list[dict[str, Any]]:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("Memory Manager output does not contain JSON.")
-    payload = json.loads(text[start : end + 1])
-    decisions = payload.get("memory", [])
-    if not isinstance(decisions, list):
-        raise ValueError("Memory Manager output has no memory list.")
-    return [item for item in decisions if isinstance(item, dict)]
-
-
-def apply_decisions(
-    memory_bank: list[dict[str, Any]],
-    decisions: list[dict[str, Any]],
-    dialogue_id: str,
-    turn_index: int,
-    default_speaker: str,
-    timestamp: str,
-) -> None:
-    by_id = {str(memory.get("id", "")): memory for memory in memory_bank}
-    next_id = len(memory_bank)
-    for decision in decisions:
-        event = str(decision.get("event", "NONE")).upper()
-        memory_id = str(decision.get("id", ""))
-        text = str(decision.get("text", "")).strip()
-        if event == "ADD" and text:
-            entry = {
-                "id": f"{dialogue_id}:m{next_id}",
-                "text": text,
-                "source_turn": turn_index,
-                "speaker": str(decision.get("speaker", default_speaker)),
-                "timestamp": str(decision.get("timestamp", timestamp)),
-            }
-            next_id += 1
-            memory_bank.append(entry)
-            by_id[entry["id"]] = entry
-        elif event == "UPDATE" and memory_id in by_id and text:
-            by_id[memory_id]["text"] = text
-            by_id[memory_id]["source_turn"] = turn_index
-        elif event == "DELETE" and memory_id in by_id:
-            entry = by_id.pop(memory_id)
-            memory_bank.remove(entry)
 
 
 class Manager:
@@ -173,7 +117,7 @@ class Manager:
 
     def generate(self, old_memory: list[dict[str, Any]], facts: list[dict[str, Any]], top_k: int) -> str:
         query = " ".join(fact["text"] for fact in facts)
-        retrieved = top_k_fn(query, old_memory, top_k)
+        retrieved = retrieve(query, old_memory, top_k)
         prompt = build_manager_input(retrieved, facts)
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
         with self.torch.no_grad():
@@ -186,10 +130,6 @@ class Manager:
             )
         prompt_length = inputs["input_ids"].shape[1]
         return self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
-
-
-top_k_fn = top_k
-
 
 def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
     manager = Manager(model_path, device, max_new_tokens)
@@ -207,9 +147,7 @@ def construct(input_path: str, output_path: str, model_path: str, device: str, r
                 memory_bank,
                 parse_manager_output(output),
                 dialogue_id,
-                turn_index,
-                str(turn.get("speaker", "")),
-                str(turn.get("timestamp", "")),
+                turn,
             )
         results.append({
             "dialogue_id": dialogue_id,

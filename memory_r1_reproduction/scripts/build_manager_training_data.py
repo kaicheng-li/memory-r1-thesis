@@ -1,9 +1,9 @@
 """Build Memory Manager training tuples directly from raw LoCoMo JSON.
 
-For every turn t, NVIDIA NIM summarizes the preceding 50 turns into a
+For every turn t, NVIDIA NIM summarizes the preceding 24 turns into a
 temporal memory bank and extracts the turn's key facts (LLMExtract,
 Algorithm 5 line 7). The output row contains the bank, the window turns
-(preceding 50 + the current turn, each carrying its extracted facts, replayed
+(preceding 24 + the current turn, each carrying its extracted facts, replayed
 by Algorithm 5), the current turn, and QA pairs linked to that turn. It
 contains no memory-operation labels.
 """
@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -89,23 +90,27 @@ def normalize_locomo_sample(sample: dict[str, Any]) -> dict[str, Any]:
     for qa_index, raw_qa in enumerate(sample.get("qa", [])):
         if not isinstance(raw_qa, dict):
             continue
-        evidence = raw_qa.get("evidence", [])
-        if isinstance(evidence, str):
-            evidence = [evidence]
-        turn_index = raw_qa.get("turn_index")
-        if turn_index is None:
-            turn_index = next((evidence_to_index.get(str(item)) for item in evidence if str(item) in evidence_to_index), None)
-        if turn_index is None:
+        evidence = [
+            evidence_id.strip()
+            for item in raw_qa["evidence"]
+            for evidence_id in re.split(r"[;,\s]+", str(item))
+            if evidence_id.strip()
+        ]
+        if any(evidence_id not in evidence_to_index for evidence_id in evidence):
+            continue
+        evidence_turn_indices = [evidence_to_index[evidence_id] for evidence_id in evidence]
+        if not evidence_turn_indices:
             continue
         answer = raw_qa.get("answer", "")
         if isinstance(answer, list):
             answer = ", ".join(str(item) for item in answer)
         questions.append({
             "question_id": str(raw_qa.get("question_id", qa_index)),
-            "turn_index": int(turn_index),
+            "turn_index": max(evidence_turn_indices),
             "question": str(raw_qa.get("question", "")),
             "answer": str(answer),
             "evidence": evidence,
+            "evidence_turn_indices": evidence_turn_indices,
         })
 
     participants = [str(value) for key in ("speaker_a", "speaker_b") if (value := conversation.get(key))]
@@ -129,14 +134,11 @@ def load_dialogues(payload: Any) -> list[dict[str, Any]]:
 def validate_questions(dialogue: dict[str, Any]) -> None:
     turn_count = len(dialogue.get("turns", []))
     for index, question in enumerate(dialogue.get("questions", [])):
-        if "turn_index" not in question:
-            raise ValueError(f"{dialogue['dialogue_id']} question {index} has no turn_index.")
-        try:
-            turn_index = int(question["turn_index"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{dialogue['dialogue_id']} question {index} has an invalid turn_index.") from exc
+        turn_index = question["turn_index"]
         if not 0 <= turn_index < turn_count:
             raise ValueError(f"{dialogue['dialogue_id']} question {index} points outside its turns.")
+        if turn_index != max(question["evidence_turn_indices"]):
+            raise ValueError(f"{dialogue['dialogue_id']} question {index} has an inconsistent terminal turn.")
 
 
 class NvidiaMemoryBankBuilder:
@@ -147,16 +149,11 @@ class NvidiaMemoryBankBuilder:
         self.max_retries = max_retries
         self.cache = read_json(cache_path) if self.cache_path.exists() else {}
         self._facts_by_turn = {}
-        self._memory_banks_by_turn = {}
         for cached_key, value in self.cache.items():
             if cached_key.startswith("facts:"):
                 record_key, separator, _ = cached_key.rpartition(":")
                 if separator:
-                    self._facts_by_turn.setdefault(record_key, value)
-            elif ":w" in cached_key:
-                record_key, _, _ = cached_key.rpartition(":w")
-                if record_key:
-                    self._memory_banks_by_turn.setdefault(record_key, value)
+                    self._facts_by_turn[record_key] = value
         LOGGER.info(
             "teacher=%s cache=%s cached_items=%d max_tokens=%d max_retries=%d",
             model,
@@ -169,8 +166,8 @@ class NvidiaMemoryBankBuilder:
     def _facts_record(self, key: str) -> Any | None:
         return self.cache.get(key, self._facts_by_turn.get(key))
 
-    def _memory_bank_record(self, dialogue_id: str, turn_index: int, key: str) -> Any | None:
-        return self.cache.get(key, self._memory_banks_by_turn.get(f"{dialogue_id}:{turn_index}"))
+    def _memory_bank_record(self, key: str) -> Any | None:
+        return self.cache.get(key)
 
     def _client(self):
         try:
@@ -324,7 +321,7 @@ class NvidiaMemoryBankBuilder:
 
     def build(self, dialogue_id: str, turn_index: int, previous_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key = f"{dialogue_id}:{turn_index}:w{HISTORY_WINDOW}"
-        record = self._memory_bank_record(dialogue_id, turn_index, key)
+        record = self._memory_bank_record(key)
         if record is not None:
             LOGGER.info("cache hit: memory_bank dialogue=%s turn=%d", dialogue_id, turn_index)
             return record
@@ -396,10 +393,12 @@ def build(input_path: str, output_path: str, cache_path: str, model: str, max_to
             LOGGER.info("memory progress dialogue=%s turn=%d/%d", dialogue_id, turn_index + 1, len(turns))
             start = max(0, turn_index - HISTORY_WINDOW)
             memory_bank = builder.build(dialogue_id, turn_index, turns[start:turn_index])
+            window_turn_ids = {turn["dia_id"] for turn in turns[start : turn_index + 1]}
             linked_questions = [
                 question
                 for question in dialogue.get("questions", [])
-                if int(question["turn_index"]) == turn_index
+                if question["turn_index"] == turn_index
+                and set(question["evidence"]).issubset(window_turn_ids)
             ]
             window_turns = []
             for window_index in range(start, turn_index + 1):

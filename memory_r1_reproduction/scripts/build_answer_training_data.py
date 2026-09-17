@@ -1,36 +1,25 @@
-"""Build Answer Agent training tuples (paper: Answer Agent Training Data).
-
-For every question linked to a turn in the Algorithm 1 tuples, retrieve the
-60 most relevant memories from that turn's teacher-built temporal memory bank
-(GPT-4o-mini), and emit (question, retrieved_memories, gold answer) tuples.
-
-No Memory Manager is replayed here: the temporal banks already exist as the
-Algorithm 1 output.
-"""
+"""Build Answer Agent tuples from a Memory Manager-produced memory bank."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import re
+import sys
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve_per_speaker
+from scripts.construct_memory_bank import Manager, load_dialogues
 
 TOP_K = 60
 
 
-def read_rows(path: str) -> list[dict[str, Any]]:
-    """Read a JSONL or JSON dataset into a list of rows."""
-    path = Path(path)
-    if path.suffix == ".jsonl":
-        return [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return payload if isinstance(payload, list) else [payload]
+def read_json(path: str) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def write_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
@@ -41,54 +30,92 @@ def write_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def word_score(question: str, memory: dict[str, Any]) -> float:
-    question_tokens = set(re.findall(r"[a-zA-Z0-9]+", question.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", memory.get("text", "").lower()))
-    denominator = math.sqrt(len(question_tokens) * len(memory_tokens))
-    return len(question_tokens & memory_tokens) / denominator if denominator else 0.0
+def raw_questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
+    questions = sample.get("qa", sample.get("questions", []))
+    return [
+        {
+            "question_id": str(question.get("question_id", index)),
+            "question": str(question["question"]),
+            "answer": str(question.get("answer", "")),
+        }
+        for index, question in enumerate(questions)
+        if question.get("question")
+    ]
 
 
-def retrieve_memories(question: str, memory_bank: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: word_score(question, memory), reverse=True)[:top_k]
-
-
-def build(input_path: str, output_path: str, retrieval_top_k: int) -> None:
+def build(
+    input_path: str,
+    output_path: str,
+    manager_model: str,
+    manager_device: str,
+    manager_top_k: int,
+    per_speaker_top_k: int,
+    max_new_tokens: int,
+) -> None:
+    raw_samples = read_json(input_path)
+    raw_samples = raw_samples if isinstance(raw_samples, list) else [raw_samples]
+    dialogues = load_dialogues(raw_samples)
+    manager = Manager(manager_model, manager_device, max_new_tokens)
     rows = []
-    for row in read_rows(input_path):
-        if not isinstance(row, dict):
-            continue
-        bank = row.get("temporal_memory_bank", [])
-        if not isinstance(bank, list):
-            continue
-        for question in row.get("linked_questions", []):
-            if not isinstance(question, dict) or not question.get("question"):
+
+    for raw_sample, dialogue in zip(raw_samples, dialogues):
+        dialogue_id = str(dialogue["dialogue_id"])
+        memory_bank: list[dict[str, Any]] = []
+
+        for turn in dialogue["turns"]:
+            facts = manager.extract(turn)
+            if not facts:
                 continue
-            candidates = retrieve_memories(question["question"], bank, retrieval_top_k)
+            manager_output = manager.generate(memory_bank, facts, manager_top_k)
+            decisions = parse_manager_output(manager_output)
+            apply_decisions(memory_bank, decisions, dialogue_id, turn)
+
+        for question in raw_questions(raw_sample):
+            memories = retrieve_per_speaker(
+                question["question"],
+                memory_bank,
+                dialogue["participants"],
+                per_speaker_top_k,
+            )
             rows.append(
                 {
-                    "dialogue_id": str(row.get("dialogue_id", "dialogue")),
-                    "question_id": str(question.get("question_id", "")),
+                    "dialogue_id": dialogue_id,
+                    "question_id": question["question_id"],
                     "question": question["question"],
-                    "retrieved_memories": candidates,
-                    "answer": str(question.get("answer", "")),
+                    "retrieved_memories": memories,
+                    "answer": question["answer"],
                     "metadata": {
-                        "bank_turn": int(row.get("turn_index", 0)),
-                        "top_k": retrieval_top_k,
-                        "retrieved_count": len(candidates),
+                        "manager_model": manager_model,
+                        "manager_top_k": manager_top_k,
+                        "per_speaker_top_k": per_speaker_top_k,
+                        "memory_size": len(memory_bank),
                     },
                 }
             )
+
     write_jsonl(output_path, rows)
     print(f"wrote {len(rows)} Answer tuples to {output_path}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build Answer Agent training tuples from Algorithm 1 output.")
-    parser.add_argument("--input", required=True, help="Algorithm 1 tuples (build_manager_training_data.py output)")
+    parser = argparse.ArgumentParser(description="Build Answer Agent tuples from Manager-generated memories.")
+    parser.add_argument("--input", required=True, help="Raw LoCoMo JSON file.")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--retrieval-top-k", type=int, default=TOP_K)
+    parser.add_argument("--manager-model", required=True, help="Memory Manager checkpoint.")
+    parser.add_argument("--manager-device", default="auto")
+    parser.add_argument("--manager-top-k", type=int, default=5)
+    parser.add_argument("--per-speaker-top-k", type=int, default=30)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
-    build(args.input, args.output, args.retrieval_top_k)
+    build(
+        args.input,
+        args.output,
+        args.manager_model,
+        args.manager_device,
+        args.manager_top_k,
+        args.per_speaker_top_k,
+        args.max_new_tokens,
+    )
 
 
 if __name__ == "__main__":

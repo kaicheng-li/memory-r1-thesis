@@ -15,6 +15,7 @@ builder (Algorithm 2), not by this loop.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -33,6 +34,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_retriever import build_answer_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve, retrieve_per_speaker
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -52,98 +54,20 @@ def read_rows(path: str) -> list[dict[str, Any]]:
 # Algorithm 1 tuple loading
 # ---------------------------------------------------------------------------
 
-def is_tuple_data(rows: list[dict[str, Any]]) -> bool:
-    first = next((row for row in rows if isinstance(row, dict)), None)
-    return bool(first) and ("temporal_memory_bank" in first or "current_turn" in first)
-
-
 def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Algorithm 1 rows -> (dialogue_turns, temporal_memory_bank, current_turn, linked_questions)."""
-    tuples = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        current_turn = row.get("current_turn")
-        if not isinstance(current_turn, dict):
-            continue
-        bank = row.get("temporal_memory_bank", [])
-        dialogue_turns = [
-            turn
-            for turn in row.get("dialogue_turns", [])
-            if isinstance(turn, dict) and str(turn.get("text", "")).strip()
-        ]
-        tuples.append(
-            {
-                "dialogue_id": str(row.get("dialogue_id", "dialogue")),
-                "turn_index": int(row.get("turn_index", 0)),
-                "temporal_memory_bank": bank if isinstance(bank, list) else [],
-                "dialogue_turns": dialogue_turns,
-                "current_turn": current_turn,
-                "linked_questions": [
-                    question
-                    for question in row.get("linked_questions", [])
-                    if isinstance(question, dict) and question.get("question")
-                ],
-            }
-        )
-    return tuples
-
-
-# ---------------------------------------------------------------------------
-# Memory bank mechanics
-# ---------------------------------------------------------------------------
-
-def lexical_score(query: str, memory: dict[str, Any]) -> float:
-    query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", str(memory.get("text", "")).lower()))
-    denominator = math.sqrt(len(query_tokens) * len(memory_tokens))
-    return len(query_tokens & memory_tokens) / denominator if denominator else 0.0
-
-
-def retrieve(query: str, memory_bank: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: lexical_score(query, memory), reverse=True)[:top_k]
-
-
-def parse_manager_output(text: str) -> list[dict[str, Any]]:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("Memory Manager output does not contain JSON.")
-    payload = json.loads(text[start : end + 1])
-    decisions = payload.get("memory", [])
-    if not isinstance(decisions, list):
-        raise ValueError("Memory Manager output has no memory list.")
-    return [item for item in decisions if isinstance(item, dict)]
-
-
-def apply_decisions(
-    memory_bank: list[dict[str, Any]],
-    decisions: list[dict[str, Any]],
-    dialogue_id: str,
-    turn_index: int,
-    turn: dict[str, Any],
-) -> None:
-    by_id = {str(memory.get("id", "")): memory for memory in memory_bank}
-    next_id = len(memory_bank)
-    for decision in decisions:
-        event = str(decision.get("event", "NONE")).upper()
-        memory_id = str(decision.get("id", ""))
-        text = str(decision.get("text", "")).strip()
-        if event == "ADD" and text:
-            entry = {
-                "id": f"{dialogue_id}:m{next_id}",
-                "text": text,
-                "source_turn": turn_index,
-                "timestamp": str(turn.get("timestamp", "")),
-            }
-            next_id += 1
-            memory_bank.append(entry)
-            by_id[entry["id"]] = entry
-        elif event == "UPDATE" and memory_id in by_id and text:
-            by_id[memory_id]["text"] = text
-            by_id[memory_id]["source_turn"] = turn_index
-        elif event == "DELETE" and memory_id in by_id:
-            entry = by_id.pop(memory_id)
-            memory_bank.remove(entry)
+    return [
+        {
+            "dialogue_id": row["dialogue_id"],
+            "turn_index": row["turn_index"],
+            "participants": row["participants"],
+            "temporal_memory_bank": row["temporal_memory_bank"],
+            "dialogue_turns": row["dialogue_turns"],
+            "current_turn": row["current_turn"],
+            "linked_questions": row["linked_questions"],
+        }
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +96,41 @@ def answer_reward(prediction: str, gold: str) -> float:
     precision = overlap / len(prediction_tokens) if prediction_tokens else 0.0
     recall = overlap / len(gold_tokens)
     return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+
+def evidence_ids(question: dict[str, Any]) -> set[str]:
+    """Return source turn ids supplied by LoCoMo QA annotations."""
+    return set(question["evidence"])
+
+
+def memory_source_ids(memory: list[dict[str, Any]]) -> set[str]:
+    """Collect provenance ids without treating updated text as new evidence."""
+    return {source for entry in memory for source in entry["source_turn_ids"]}
+
+
+def evidence_potential(
+    question: dict[str, Any],
+    memory: list[dict[str, Any]],
+    answer_top_k: int,
+    participants: list[str],
+    available_evidence: set[str],
+) -> float:
+    """Measure how much annotated evidence is stored and retrievable.
+
+    This is training-only privileged information. The Answer Agent still sees
+    only the retrieved memory, never the original dialogue or evidence labels.
+    """
+    all_evidence = evidence_ids(question)
+    if not all_evidence:
+        return 0.0
+
+    stored = memory_source_ids(memory)
+    memory_coverage = len(available_evidence & stored) / len(all_evidence)
+
+    retrieved = retrieve_per_speaker(question["question"], memory, participants, answer_top_k)
+    retrieved_sources = memory_source_ids(retrieved)
+    retrieval_coverage = len(available_evidence & retrieved_sources) / len(all_evidence)
+    return 0.5 * memory_coverage + 0.5 * retrieval_coverage
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +191,19 @@ class TextModel:
 
 
 
-def answer_with_model(answer_model: TextModel, question: str, memories: list[dict[str, Any]], max_new_tokens: int,temperature: float) -> str:
-    prompt = build_answer_input(question, {"Memory Bank": memories})
+def answer_with_model(
+    answer_model: TextModel,
+    question: str,
+    memories: list[dict[str, Any]],
+    participants: list[str],
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    memories_by_speaker = {
+        participant: [memory for memory in memories if memory["speaker"] == participant]
+        for participant in participants
+    }
+    prompt = build_answer_input(question, memories_by_speaker)
     raw, _ = answer_model.generate(prompt, max_new_tokens, temperature=temperature)
     return raw.rsplit("Answer:", 1)[-1].strip()
 
@@ -247,14 +217,49 @@ def apply_policy_update(
     reference: TextModel | None,
     optimizer: torch.optim.Optimizer,
     trajectories: list[dict[str, Any]],
-    rewards: list[float],
+    rewards: list[list[float]],
     args: argparse.Namespace,
 ) -> float:
-    rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=manager.device)
-    advantages = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std(unbiased=False) + 1e-6)
+    returns = []
+    for trajectory_rewards in rewards:
+        trajectory_returns = [0.0] * len(trajectory_rewards)
+        running_return = 0.0
+        for index in reversed(range(len(trajectory_rewards))):
+            running_return = trajectory_rewards[index] + args.gamma * running_return
+            trajectory_returns[index] = running_return
+        returns.append(trajectory_returns)
+
     action_losses = []
-    for trajectory, advantage in zip(trajectories, advantages):
-        for prompt, completion_ids, old_token_log_probs in trajectory["actions"]:
+    action_positions = sorted({
+        action["turn_position"]
+        for trajectory in trajectories
+        for action in trajectory["actions"]
+    })
+    for position in action_positions:
+        active = []
+        for row_index, trajectory in enumerate(trajectories):
+            for action_index, action in enumerate(trajectory["actions"]):
+                if action["turn_position"] == position:
+                    active.append((trajectory, returns[row_index][action_index]))
+                    break
+        if not active:
+            continue
+        local_rewards = torch.tensor(
+            [reward for _, reward in active],
+            dtype=torch.float32,
+            device=manager.device,
+        )
+        advantages = (local_rewards - local_rewards.mean()) / (
+            local_rewards.std(unbiased=False) + 1e-6
+        )
+        for (trajectory, _), advantage in zip(active, advantages):
+            action = next(
+                action for action in trajectory["actions"]
+                if action["turn_position"] == position
+            )
+            prompt = action["prompt"]
+            completion_ids = action["completion_ids"]
+            old_token_log_probs = action["old_token_log_probs"]
             token_log_probs = manager.log_probability(prompt, completion_ids)  # [L']
             if token_log_probs.numel() == 0:
                 continue
@@ -298,7 +303,8 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
     using the turn's teacher-extracted facts (LLMExtract) — retrieve with the
     facts -> manager op -> apply; then answer the linked questions with the
     frozen Answer Agent over the resulting bank. One GRPO/PPO update per
-    tuple over its num_generations trajectories.
+    tuple over its num_generations trajectories. Evidence-aware potential
+    differences provide turn-level credit in addition to final QA reward.
     """
     progress = tqdm(tuples, desc=f"memory-manager-{args.algorithm}")
     for item in progress:
@@ -311,6 +317,7 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
         for _ in range(args.num_generations):
             memory: list[dict[str, Any]] = []
             actions = []
+            memory_states = []
             valid = True
             for local_index, turn in enumerate(turns):
                 facts = [
@@ -333,31 +340,92 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 completion, completion_ids = manager.generate(prompt, args.max_new_tokens, args.temperature)
                 with torch.no_grad():
                     old_token_log_probs = manager.log_probability(prompt, completion_ids).detach()
-                actions.append((prompt, completion_ids, old_token_log_probs))
+                actions.append(
+                    {
+                        "prompt": prompt,
+                        "completion_ids": completion_ids,
+                        "old_token_log_probs": old_token_log_probs,
+                        "turn_position": local_index,
+                    }
+                )
                 try:
                     decisions = parse_manager_output(completion)
-                    apply_decisions(memory, decisions, item["dialogue_id"], int(turn.get("turn_index", local_index)), turn)
-                except Exception:
+                    apply_decisions(memory, decisions, item["dialogue_id"], turn)
+                    memory_states.append(copy.deepcopy(memory))
+                except (json.JSONDecodeError, KeyError, TypeError):
                     valid = False
                     break
-            trajectories.append({"memory": memory, "actions": actions, "valid": valid})
+            trajectories.append(
+                {
+                    "memory": memory,
+                    "actions": actions,
+                    "memory_states": memory_states,
+                    "valid": valid,
+                }
+            )
 
-        rewards = []
+        rewards: list[list[float]] = []
         for trajectory in trajectories:
             if not trajectory["valid"] or not trajectory["actions"]:
-                rewards.append(0.0)
+                rewards.append([0.0] * len(trajectory["actions"]))
                 continue
+
+            turn_rewards = [0.0] * len(trajectory["actions"])
+            previous_potentials = [0.0] * len(questions)
+            seen_turn_ids: set[str] = set()
+            for action_index, (state, action) in enumerate(zip(trajectory["memory_states"], trajectory["actions"])):
+                seen_turn_ids.update(
+                    turn["dia_id"]
+                    for turn in turns[: action["turn_position"] + 1]
+                )
+                current_potentials = [
+                    evidence_potential(
+                        question,
+                        state,
+                        args.answer_top_k,
+                        item["participants"],
+                        seen_turn_ids & evidence_ids(question),
+                    )
+                    for question in questions
+                ]
+                dense_delta = sum(
+                    args.gamma * current - previous
+                    for current, previous in zip(current_potentials, previous_potentials)
+                )
+                if questions:
+                    turn_rewards[action_index] += (
+                        args.evidence_weight * dense_delta / len(questions)
+                    )
+                previous_potentials = current_potentials
+
             question_rewards = []
             for question in questions:
-                retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
-                prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens,args.answer_temperature)
+                retrieved = retrieve_per_speaker(
+                    question["question"],
+                    trajectory["memory"],
+                    item["participants"],
+                    args.answer_top_k,
+                )
+                prediction = answer_with_model(
+                    answer,
+                    question["question"],
+                    retrieved,
+                    item["participants"],
+                    args.answer_max_new_tokens,
+                    args.answer_temperature,
+                )
                 question_rewards.append(reward_fn(prediction, question["answer"]))
-            rewards.append(sum(question_rewards) / len(question_rewards))
+            turn_rewards[-1] += sum(question_rewards) / len(question_rewards)
+            rewards.append(turn_rewards)
 
         loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
         if math.isnan(loss):
             continue
-        progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
+        flat_rewards = [value for row in rewards for value in row]
+        progress.set_postfix(
+            loss=loss,
+            reward=float(torch.tensor(flat_rewards).mean()) if flat_rewards else 0.0,
+        )
 
 
 def save_checkpoint(manager: TextModel, output_dir: Path, epoch: int) -> None:
@@ -378,11 +446,6 @@ def train(args: argparse.Namespace) -> None:
     reward_fn = exact_match_reward if args.reward == "em" else answer_reward
 
     rows = read_rows(args.data_path)
-    if not is_tuple_data(rows):
-        raise SystemExit(
-            "Data must be Algorithm 1 tuples (build_manager_training_data.py output): "
-            "rows have to contain 'temporal_memory_bank'/'current_turn'."
-        )
     tuples = normalize_tuples(rows)
     for item in tuples:
         for turn in item["dialogue_turns"]:
@@ -417,6 +480,18 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--answer-max-new-tokens", type=int, default=256)
     parser.add_argument("--answer-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        help="Discount used for dense reward and return-to-go.",
+    )
+    parser.add_argument(
+        "--evidence-weight",
+        type=float,
+        default=0.5,
+        help="Weight of evidence-aware per-turn potential shaping.",
+    )
     args = parser.parse_args()
     train(args)
 
