@@ -75,6 +75,23 @@ def top_k(query: str, memory_bank: list[dict[str, Any]], k: int) -> list[dict[st
     return sorted(memory_bank, key=lambda memory: score(query, memory), reverse=True)[:k]
 
 
+def top_k_per_speaker(
+    query: str,
+    memory_bank: list[dict[str, Any]],
+    participants: list[str],
+    k: int,
+) -> list[dict[str, Any]]:
+    return [
+        memory
+        for participant in participants
+        for memory in top_k(
+            query,
+            [entry for entry in memory_bank if entry["speaker"] == participant],
+            k,
+        )
+    ]
+
+
 def parse_manager_output(text: str) -> list[dict[str, Any]]:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:

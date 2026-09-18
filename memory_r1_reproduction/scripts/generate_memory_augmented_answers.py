@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,22 +13,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_retriever import build_answer_input
+from scripts.construct_memory_bank import top_k_per_speaker
 
 
 def read_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def score(query: str, memory: dict[str, Any]) -> float:
-    query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", str(memory.get("text", "")).lower()))
-    denominator = math.sqrt(len(query_tokens) * len(memory_tokens))
-    return len(query_tokens & memory_tokens) / denominator if denominator else 0.0
-
-
-def top_k(query: str, memory_bank: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: score(query, memory), reverse=True)[:k]
 
 
 def raw_questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
@@ -65,8 +53,12 @@ class AnswerAgent:
         self.model.eval()
         self.max_new_tokens = max_new_tokens
 
-    def answer(self, question: str, memories: list[dict[str, Any]]) -> tuple[str, str]:
-        prompt = build_answer_input(question, {"Memory Bank": memories})
+    def answer(self, question: str, memories: list[dict[str, Any]], participants: list[str]) -> tuple[str, str]:
+        memories_by_speaker = {
+            participant: [memory for memory in memories if memory["speaker"] == participant]
+            for participant in participants
+        }
+        prompt = build_answer_input(question, memories_by_speaker)
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
@@ -85,15 +77,22 @@ class AnswerAgent:
 def generate(input_path: str, memory_bank_path: str, output_path: str, answer_model: str, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
     samples = read_json(input_path)
     samples = samples if isinstance(samples, list) else [samples]
-    memory_banks = {str(item["dialogue_id"]): item.get("memory_bank", []) for item in read_json(memory_bank_path)}
+    memory_banks = {str(item["dialogue_id"]): item for item in read_json(memory_bank_path)}
     agent = AnswerAgent(answer_model, device, max_new_tokens)
     rows = []
     for sample in samples:
         dialogue_id = str(sample.get("sample_id", sample.get("dialogue_id", "dialogue")))
-        bank = memory_banks.get(dialogue_id, [])
+        memory_record = memory_banks[dialogue_id]
+        bank = memory_record["memory_bank"]
+        participants = memory_record["participants"]
         for question in raw_questions(sample):
-            retrieved = top_k(question["question"], bank, retrieval_top_k)
-            answer, raw_output = agent.answer(question["question"], retrieved)
+            retrieved = top_k_per_speaker(
+                question["question"],
+                bank,
+                participants,
+                retrieval_top_k,
+            )
+            answer, raw_output = agent.answer(question["question"], retrieved, participants)
             rows.append({
                 "dialogue_id": dialogue_id,
                 "question_id": question["question_id"],
@@ -115,7 +114,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--answer-model", required=True)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--retrieval-top-k", type=int, default=60)
+    parser.add_argument("--retrieval-top-k", type=int, default=30, help="Top-k memories per participant.")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
     generate(args.input, args.memory_bank, args.output, args.answer_model, args.device, args.retrieval_top_k, args.max_new_tokens)

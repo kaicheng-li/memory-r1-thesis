@@ -58,6 +58,7 @@ def read_rows(path: str) -> list[dict[str, Any]]:
             {
                 "question": str(question),
                 "memories": row.get("retrieved_memories", row.get("memory_bank", [])),
+                "participants": row.get("participants", []),
                 "gold": str(row.get("answer", row.get("gold_answer", ""))),
             }
         )
@@ -210,7 +211,14 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(args.epochs):
         progress = tqdm(samples, desc=f"answer-grpo-epoch-{epoch + 1}")
         for sample in progress:
-            prompt = build_answer_input(sample["question"], {"Memory Bank": sample["memories"]})
+            memories_by_speaker = {
+                participant: [
+                    memory for memory in sample["memories"]
+                    if memory["speaker"] == participant
+                ]
+                for participant in sample["participants"]
+            }
+            prompt = build_answer_input(sample["question"], memories_by_speaker)
             completions = generate_completions(
                 actor, tokenizer, prompt, args.num_generations, args.max_new_tokens, args.temperature, device
             )
