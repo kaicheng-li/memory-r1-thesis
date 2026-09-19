@@ -31,8 +31,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from memfactory.modules.memory_retriever import build_answer_input
 from memfactory.modules.memory_updater import build_manager_input
+from scripts.construct_memory_bank import (
+    apply_decisions,
+    parse_manager_output,
+    top_k,
+    top_k_per_speaker,
+)
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -75,6 +80,7 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tuples.append(
             {
                 "dialogue_id": str(row.get("dialogue_id", "dialogue")),
+                "participants": row.get("participants", []),
                 "turn_index": int(row.get("turn_index", 0)),
                 "temporal_memory_bank": bank if isinstance(bank, list) else [],
                 "dialogue_turns": dialogue_turns,
@@ -87,63 +93,6 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return tuples
-
-
-# ---------------------------------------------------------------------------
-# Memory bank mechanics
-# ---------------------------------------------------------------------------
-
-def lexical_score(query: str, memory: dict[str, Any]) -> float:
-    query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", str(memory.get("text", "")).lower()))
-    denominator = math.sqrt(len(query_tokens) * len(memory_tokens))
-    return len(query_tokens & memory_tokens) / denominator if denominator else 0.0
-
-
-def retrieve(query: str, memory_bank: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: lexical_score(query, memory), reverse=True)[:top_k]
-
-
-def parse_manager_output(text: str) -> list[dict[str, Any]]:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("Memory Manager output does not contain JSON.")
-    payload = json.loads(text[start : end + 1])
-    decisions = payload.get("memory", [])
-    if not isinstance(decisions, list):
-        raise ValueError("Memory Manager output has no memory list.")
-    return [item for item in decisions if isinstance(item, dict)]
-
-
-def apply_decisions(
-    memory_bank: list[dict[str, Any]],
-    decisions: list[dict[str, Any]],
-    dialogue_id: str,
-    turn_index: int,
-    turn: dict[str, Any],
-) -> None:
-    by_id = {str(memory.get("id", "")): memory for memory in memory_bank}
-    next_id = len(memory_bank)
-    for decision in decisions:
-        event = str(decision.get("event", "NONE")).upper()
-        memory_id = str(decision.get("id", ""))
-        text = str(decision.get("text", "")).strip()
-        if event == "ADD" and text:
-            entry = {
-                "id": f"{dialogue_id}:m{next_id}",
-                "text": text,
-                "source_turn": turn_index,
-                "timestamp": str(turn.get("timestamp", "")),
-            }
-            next_id += 1
-            memory_bank.append(entry)
-            by_id[entry["id"]] = entry
-        elif event == "UPDATE" and memory_id in by_id and text:
-            by_id[memory_id]["text"] = text
-            by_id[memory_id]["source_turn"] = turn_index
-        elif event == "DELETE" and memory_id in by_id:
-            entry = by_id.pop(memory_id)
-            memory_bank.remove(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +182,24 @@ class TextModel:
 
 
 def answer_with_model(answer_model: TextModel, question: str, memories: list[dict[str, Any]], max_new_tokens: int,temperature: float) -> str:
-    prompt = build_answer_input(question, {"Memory Bank": memories})
+    raise RuntimeError("Use answer_with_model_by_speaker.")
+
+
+def answer_with_model_by_speaker(
+    answer_model: TextModel,
+    question: str,
+    memories: list[dict[str, Any]],
+    participants: list[str],
+    max_new_tokens: int,
+    temperature: float,
+) -> str:
+    from memfactory.modules.memory_retriever import build_answer_input
+
+    memories_by_speaker = {
+        participant: [memory for memory in memories if memory["speaker"] == participant]
+        for participant in participants
+    }
+    prompt = build_answer_input(question, memories_by_speaker)
     raw, _ = answer_model.generate(prompt, max_new_tokens, temperature=temperature)
     return raw.rsplit("Answer:", 1)[-1].strip()
 
@@ -328,7 +294,7 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 if not facts:
                     continue
                 query = " ".join(fact["text"] for fact in facts)
-                old_memory = retrieve(query, memory, args.manager_top_k)
+                old_memory = top_k(query, memory, args.manager_top_k)
                 prompt = build_manager_input(old_memory, facts)
                 completion, completion_ids = manager.generate(prompt, args.max_new_tokens, args.temperature)
                 with torch.no_grad():
@@ -336,7 +302,14 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 actions.append((prompt, completion_ids, old_token_log_probs))
                 try:
                     decisions = parse_manager_output(completion)
-                    apply_decisions(memory, decisions, item["dialogue_id"], int(turn.get("turn_index", local_index)), turn)
+                    apply_decisions(
+                        memory,
+                        decisions,
+                        item["dialogue_id"],
+                        int(turn.get("turn_index", local_index)),
+                        str(turn.get("speaker", "")),
+                        str(turn.get("timestamp", "")),
+                    )
                 except Exception:
                     valid = False
                     break
@@ -349,8 +322,20 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 continue
             question_rewards = []
             for question in questions:
-                retrieved = retrieve(question["question"], trajectory["memory"], args.answer_top_k)
-                prediction = answer_with_model(answer, question["question"], retrieved, args.answer_max_new_tokens,args.answer_temperature)
+                retrieved = top_k_per_speaker(
+                    question["question"],
+                    trajectory["memory"],
+                    item["participants"],
+                    args.answer_top_k_per_speaker,
+                )
+                prediction = answer_with_model_by_speaker(
+                    answer,
+                    question["question"],
+                    retrieved,
+                    item["participants"],
+                    args.answer_max_new_tokens,
+                    args.answer_temperature,
+                )
                 question_rewards.append(reward_fn(prediction, question["answer"]))
             rewards.append(sum(question_rewards) / len(question_rewards))
 
@@ -413,7 +398,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.02)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--manager-top-k", type=int, default=5)
-    parser.add_argument("--answer-top-k", type=int, default=60)
+    parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--answer-max-new-tokens", type=int, default=256)
     parser.add_argument("--answer-temperature", type=float, default=1.0)
