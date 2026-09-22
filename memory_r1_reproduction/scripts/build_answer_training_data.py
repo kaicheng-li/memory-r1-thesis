@@ -37,6 +37,7 @@ def build(
     input_path: str,
     output_path: str,
     manager_model: str,
+    manager_adapter: str | None,
     device: str,
     manager_top_k: int,
     answer_top_k_per_speaker: int,
@@ -45,7 +46,7 @@ def build(
     raw_samples = read_json(input_path)
     raw_samples = raw_samples if isinstance(raw_samples, list) else [raw_samples]
     dialogues = load_dialogues(raw_samples)
-    manager = Manager(manager_model, device, max_new_tokens)
+    manager = Manager(manager_model, device, max_new_tokens, manager_adapter)
     rows = []
 
     for raw_sample, dialogue in zip(raw_samples, dialogues):
@@ -102,6 +103,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Raw LoCoMo JSON file.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--manager-model", required=True, help="Trained Memory Manager checkpoint.")
+    parser.add_argument("--manager-adapter")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
@@ -111,6 +113,7 @@ def main() -> None:
         args.input,
         args.output,
         args.manager_model,
+        args.manager_adapter,
         args.device,
         args.manager_top_k,
         args.answer_top_k_per_speaker,

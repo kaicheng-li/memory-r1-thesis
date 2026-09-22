@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_retriever import build_answer_input
+from memfactory.lora import load_lora_model
 from scripts.construct_memory_bank import top_k_per_speaker
 
 
@@ -39,17 +40,16 @@ def raw_questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 class AnswerAgent:
-    def __init__(self, model_path: str, device: str, max_new_tokens: int):
+    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self.torch = torch
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=dtype).to(self.device)
+        self.model = load_lora_model(model_path, self.device, adapter_path=adapter_path, trainable=False)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
 
@@ -74,11 +74,11 @@ class AnswerAgent:
         return answer, raw
 
 
-def generate(input_path: str, memory_bank_path: str, output_path: str, answer_model: str, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
+def generate(input_path: str, memory_bank_path: str, output_path: str, answer_model: str, answer_adapter: str | None, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
     samples = read_json(input_path)
     samples = samples if isinstance(samples, list) else [samples]
     memory_banks = {str(item["dialogue_id"]): item for item in read_json(memory_bank_path)}
-    agent = AnswerAgent(answer_model, device, max_new_tokens)
+    agent = AnswerAgent(answer_model, device, max_new_tokens, answer_adapter)
     rows = []
     for sample in samples:
         dialogue_id = str(sample.get("sample_id", sample.get("dialogue_id", "dialogue")))
@@ -113,11 +113,12 @@ def main() -> None:
     parser.add_argument("--memory-bank", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--answer-model", required=True)
+    parser.add_argument("--answer-adapter")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=30, help="Top-k memories per participant.")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
-    generate(args.input, args.memory_bank, args.output, args.answer_model, args.device, args.retrieval_top_k, args.max_new_tokens)
+    generate(args.input, args.memory_bank, args.output, args.answer_model, args.answer_adapter, args.device, args.retrieval_top_k, args.max_new_tokens)
 
 
 if __name__ == "__main__":

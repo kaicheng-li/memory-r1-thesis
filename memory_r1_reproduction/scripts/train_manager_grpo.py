@@ -25,13 +25,14 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.lora import load_lora_model, load_reference_model, trainable_parameters
 from scripts.construct_memory_bank import (
     apply_decisions,
     parse_manager_output,
@@ -128,13 +129,12 @@ def answer_reward(prediction: str, gold: str) -> float:
 # ---------------------------------------------------------------------------
 
 class TextModel:
-    def __init__(self, model_path: str, device: str, trainable: bool):
+    def __init__(self, model_path: str, device: str, trainable: bool, adapter_path: str | None = None):
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=dtype).to(self.device)
+        self.model = load_lora_model(model_path, self.device, adapter_path, trainable)
         self.model.train(trainable)
         self.trainable = trainable
 
@@ -248,7 +248,7 @@ def apply_policy_update(
     loss = torch.stack(action_losses).mean()
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(manager.model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(trainable_parameters(manager.model), 1.0)
     optimizer.step()
     return float(loss.item())
 
@@ -356,10 +356,8 @@ def save_checkpoint(manager: TextModel, output_dir: Path, epoch: int) -> None:
 def train(args: argparse.Namespace) -> None:
     manager = TextModel(args.manager_model, args.device, trainable=True)
     reference = TextModel(args.manager_model, args.device, trainable=False) if args.beta else None
-    answer = TextModel(args.answer_model, args.device, trainable=False)
-    for parameter in answer.model.parameters():
-        parameter.requires_grad_(False)
-    optimizer = torch.optim.AdamW(manager.model.parameters(), lr=args.learning_rate)
+    answer = TextModel(args.answer_model, args.device, trainable=False, adapter_path=args.answer_adapter)
+    optimizer = torch.optim.AdamW(trainable_parameters(manager.model), lr=args.learning_rate)
     reward_fn = exact_match_reward if args.reward == "em" else answer_reward
 
     rows = read_rows(args.data_path)
@@ -387,6 +385,7 @@ def main() -> None:
     parser.add_argument("--data-path", required=True, help="Algorithm 1 tuples (build_manager_training_data.py output)")
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--answer-model", required=True)
+    parser.add_argument("--answer-adapter", required=True)
     parser.add_argument("--output-dir", default="output/memory_r1_manager")
     parser.add_argument("--algorithm", choices=["grpo", "ppo"], default="grpo")
     parser.add_argument("--reward", choices=["em", "f1"], default="em", help="Reward on the frozen answer agent's output (paper uses exact match)")
