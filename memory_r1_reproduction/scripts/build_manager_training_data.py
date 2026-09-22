@@ -1,9 +1,9 @@
 """Build Memory Manager training tuples directly from raw LoCoMo JSON.
 
-For every turn t, NVIDIA NIM summarizes the preceding 50 turns into a
+For every turn t, an OpenAI-compatible teacher summarizes the preceding 24 turns into a
 temporal memory bank and extracts the turn's key facts (LLMExtract,
 Algorithm 5 line 7). The output row contains the bank, the window turns
-(preceding 50 + the current turn, each carrying its extracted facts, replayed
+(preceding 24 + the current turn, each carrying its extracted facts, replayed
 by Algorithm 5), the current turn, and QA pairs linked to that turn. It
 contains no memory-operation labels.
 """
@@ -139,10 +139,20 @@ def validate_questions(dialogue: dict[str, Any]) -> None:
             raise ValueError(f"{dialogue['dialogue_id']} question {index} points outside its turns.")
 
 
-class NvidiaMemoryBankBuilder:
-    def __init__(self, cache_path: str, model: str, max_tokens: int, max_retries: int) -> None:
+class MemoryBankBuilder:
+    def __init__(
+        self,
+        cache_path: str,
+        model: str,
+        base_url: str,
+        api_key: str,
+        max_tokens: int,
+        max_retries: int,
+    ) -> None:
         self.cache_path = Path(cache_path)
         self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.cache = read_json(cache_path) if self.cache_path.exists() else {}
@@ -158,8 +168,9 @@ class NvidiaMemoryBankBuilder:
                 if record_key:
                     self._memory_banks_by_turn.setdefault(record_key, value)
         LOGGER.info(
-            "teacher=%s cache=%s cached_items=%d max_tokens=%d max_retries=%d",
+            "teacher=%s base_url=%s cache=%s cached_items=%d max_tokens=%d max_retries=%d",
             model,
+            base_url,
             cache_path,
             len(self.cache),
             max_tokens,
@@ -176,15 +187,11 @@ class NvidiaMemoryBankBuilder:
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise RuntimeError("Install the openai package to call NVIDIA NIM.") from exc
-
-        api_key = os.environ.get("NVIDIA_API_KEY")
-        if not api_key:
-            raise RuntimeError("NVIDIA_API_KEY is not set.")
+            raise RuntimeError("Install the openai package to call the vLLM server.") from exc
 
         return OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=api_key,
+            base_url=self.base_url,
+            api_key=self.api_key,
         )
 
     def _parse_json_content(self, content: str, label: str) -> dict[str, Any]:
@@ -197,7 +204,7 @@ class NvidiaMemoryBankBuilder:
         start, end = content.find("{"), content.rfind("}")
         if start < 0 or end < start:
             LOGGER.error("JSON object missing or truncated: %s response_tail=%r", label, content[-500:])
-            raise ValueError("NVIDIA teacher response does not contain a JSON object.")
+            raise ValueError("Teacher response does not contain a JSON object.")
         json_text = content[start : end + 1]
         try:
             payload = json.loads(json_text)
@@ -205,16 +212,16 @@ class NvidiaMemoryBankBuilder:
             LOGGER.error("JSON parse failed: %s response_tail=%r", label, json_text[-500:])
             raise
         if not isinstance(payload, dict):
-            raise ValueError("NVIDIA teacher response JSON must be an object.")
+            raise ValueError("Teacher response JSON must be an object.")
         return payload
 
     def _json_completion(self, prompt: str, label: str) -> dict[str, Any]:
-        """Call NVIDIA NIM and retry truncated or malformed JSON responses."""
+        """Call the OpenAI-compatible endpoint and retry malformed JSON responses."""
         client = self._client()
         for attempt in range(self.max_retries + 1):
             retry_prompt = prompt if attempt == 0 else prompt + COMPACT_JSON_INSTRUCTION
             LOGGER.info(
-                "NVIDIA request start: %s attempt=%d/%d prompt_chars=%d",
+                "teacher request start: %s attempt=%d/%d prompt_chars=%d",
                 label,
                 attempt + 1,
                 self.max_retries + 1,
@@ -235,27 +242,27 @@ class NvidiaMemoryBankBuilder:
             content = choice.message.content or ""
             if finish_reason == "length":
                 LOGGER.warning(
-                    "NVIDIA response truncated: %s attempt=%d/%d content_chars=%d tail=%r",
+                    "teacher response truncated: %s attempt=%d/%d content_chars=%d tail=%r",
                     label,
                     attempt + 1,
                     self.max_retries + 1,
                     len(content),
                     content[-300:],
                 )
-                error: Exception = ValueError("NVIDIA response reached max_tokens.")
+                error: Exception = ValueError("Teacher response reached max_tokens.")
             elif not content.strip():
                 LOGGER.warning(
-                    "NVIDIA response empty: %s attempt=%d/%d finish_reason=%s reasoning_chars=%d",
+                    "teacher response empty: %s attempt=%d/%d finish_reason=%s reasoning_chars=%d",
                     label,
                     attempt + 1,
                     self.max_retries + 1,
                     finish_reason,
                     len(getattr(choice.message, "reasoning_content", "") or ""),
                 )
-                error = ValueError("NVIDIA teacher returned empty final content.")
+                error = ValueError("Teacher returned empty final content.")
             else:
                 LOGGER.info(
-                    "NVIDIA request done: %s attempt=%d/%d finish_reason=%s content_chars=%d",
+                    "teacher request done: %s attempt=%d/%d finish_reason=%s content_chars=%d",
                     label,
                     attempt + 1,
                     self.max_retries + 1,
@@ -269,7 +276,7 @@ class NvidiaMemoryBankBuilder:
 
             if attempt < self.max_retries:
                 LOGGER.warning(
-                    "NVIDIA request retrying with compact output: %s reason=%s",
+                    "teacher request retrying with compact output: %s reason=%s",
                     label,
                     error,
                 )
@@ -285,7 +292,7 @@ class NvidiaMemoryBankBuilder:
         temporary_path.replace(self.cache_path)
 
     def extract_facts(self, dialogue_id: str, turn_index: int, turn: dict[str, Any]) -> list[dict[str, Any]]:
-        """LLMExtract(di): NVIDIA NIM extracts the turn's memory-relevant facts.
+        """LLMExtract(di): the teacher extracts the turn's memory-relevant facts.
 
         Extraction is deterministic per turn and cached, so Algorithm 5 can
         consume the extracted facts across all rollout trajectories without
@@ -367,9 +374,18 @@ class NvidiaMemoryBankBuilder:
         return memories
 
 
-def build(input_path: str, output_path: str, cache_path: str, model: str, max_tokens: int, max_retries: int) -> None:
+def build(
+    input_path: str,
+    output_path: str,
+    cache_path: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    max_tokens: int,
+    max_retries: int,
+) -> None:
     dialogues = load_dialogues(read_json(input_path))
-    builder = NvidiaMemoryBankBuilder(cache_path, model, max_tokens, max_retries)
+    builder = MemoryBankBuilder(cache_path, model, base_url, api_key, max_tokens, max_retries)
     rows = []
     LOGGER.info("loaded input=%s dialogues=%d", input_path, len(dialogues))
 
@@ -435,6 +451,16 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--model", default="openai/gpt-oss-20b")
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
+        help="OpenAI-compatible vLLM endpoint (default: VLLM_BASE_URL or http://127.0.0.1:8000/v1)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("VLLM_API_KEY", "EMPTY"),
+        help="vLLM API key (default: VLLM_API_KEY or EMPTY)",
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -454,7 +480,16 @@ def main() -> None:
         parser.error("--max-tokens must be positive")
     if args.max_retries < 0:
         parser.error("--max-retries cannot be negative")
-    build(args.input, args.output, args.cache, args.model, args.max_tokens, args.max_retries)
+    build(
+        args.input,
+        args.output,
+        args.cache,
+        args.model,
+        args.base_url,
+        args.api_key,
+        args.max_tokens,
+        args.max_retries,
+    )
 
 
 if __name__ == "__main__":
