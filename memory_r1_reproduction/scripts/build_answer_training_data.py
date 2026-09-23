@@ -107,7 +107,7 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
     build(
         args.input,

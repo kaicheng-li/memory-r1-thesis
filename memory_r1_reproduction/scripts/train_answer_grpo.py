@@ -248,7 +248,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.02)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--num-iterations", type=int, default=1, help="Inner GRPO update steps per rollout group")
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
     train(args)
 
