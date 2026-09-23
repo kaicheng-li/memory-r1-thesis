@@ -14,6 +14,9 @@ def load_lora_model(
     if not device.startswith("cuda"):
         raise RuntimeError("QLoRA requires a CUDA device.")
 
+    if not trainable and adapter_path is None:
+        return load_reference_model(base_model_path, device)
+
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
