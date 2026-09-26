@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.lora import load_lora_model
 from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve
 
 
@@ -64,17 +65,16 @@ def load_dialogues(payload: Any) -> list[dict[str, Any]]:
 
 
 class Manager:
-    def __init__(self, model_path: str, device: str, max_new_tokens: int):
+    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self.torch = torch
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=dtype).to(self.device)
+        self.model = load_lora_model(model_path, self.device, adapter_path=adapter_path, trainable=False)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
 
@@ -131,8 +131,8 @@ class Manager:
         prompt_length = inputs["input_ids"].shape[1]
         return self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
 
-def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
-    manager = Manager(model_path, device, max_new_tokens)
+def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int, adapter_path: str | None) -> None:
+    manager = Manager(model_path, device, max_new_tokens, adapter_path)
     samples = load_dialogues(read_json(input_path))
     results = []
     for sample in samples:
@@ -164,11 +164,12 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--manager-model", required=True)
+    parser.add_argument("--manager-adapter")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=5)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
-    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens)
+    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens, args.manager_adapter)
 
 
 if __name__ == "__main__":

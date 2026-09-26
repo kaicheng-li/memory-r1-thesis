@@ -10,22 +10,22 @@ set -x
 # output): per-turn episodes with a 24-turn dialogue window.
 DATA_PATH="${DATA_PATH:-./data/manager_training_data_evidence.jsonl}"
 RAW_DATA_PATH="${RAW_DATA_PATH:-./data/locomo10.json}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-7B-Instruct}"
 MODEL_PATH="${MODEL_PATH:-/home/models/${MODEL_NAME}}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/mem_r1_qwen25_3b}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/mem_r1_lora_evidence_${MODEL_NAME}}"
 
 # Answer Agent (paper Section 3.3) training data: Algorithm 2 tuples
 # (build_answer_training_data.py output over the Algorithm 1 temporal banks).
 ANSWER_DATA_PATH="${ANSWER_DATA_PATH:-./data/answer_training_data_evidence.jsonl}"
-ANSWER_OUTPUT_DIR="${ANSWER_OUTPUT_DIR:-./output/mem_r1_answer_${MODEL_NAME}}"
+ANSWER_OUTPUT_DIR="${ANSWER_OUTPUT_DIR:-./output/mem_r1_lora_evidence_answer_${MODEL_NAME}}"
 ANSWER_MANAGER_PATH="${ANSWER_MANAGER_PATH:-$MODEL_PATH}"
-# Optional explicit override; otherwise the last Answer Agent checkpoint is used.
-ANSWER_MODEL_PATH="${ANSWER_MODEL_PATH:-}"
+# Optional explicit override; otherwise the last Answer Agent adapter is used.
+ANSWER_ADAPTER_PATH="${ANSWER_ADAPTER_PATH:-}"
 
 # 2. Training Hyperparameters
 LR=1e-6
 BETA=0.01
-MAX_GEN_LEN=256
+MAX_GEN_LEN=2048
 NUM_GENS=8
 EPOCHS=5
 EVIDENCE_WEIGHT="${EVIDENCE_WEIGHT:-0.5}"
@@ -38,9 +38,9 @@ GAMMA="${GAMMA:-1.0}"
 
 cd "$(dirname "$0")/.." # Go to project root
 
-if [ -z "$ANSWER_MODEL_PATH" ]; then
-    if [ -d "$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}" ] && [ -z "$FORCE_ANSWER_RETRAIN" ]; then
-        echo "Answer Agent checkpoint found: $ANSWER_OUTPUT_DIR/epoch_${EPOCHS}"
+if [ -z "$ANSWER_ADAPTER_PATH" ]; then
+    if [ -f "$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}/adapter_config.json" ] && [ -z "$FORCE_ANSWER_RETRAIN" ]; then
+        echo "Answer Agent adapter found: $ANSWER_OUTPUT_DIR/epoch_${EPOCHS}"
     else
         if [ ! -f "$ANSWER_DATA_PATH" ]; then
             echo "Building Answer Agent data with Manager: $ANSWER_MANAGER_PATH ..."
@@ -48,6 +48,7 @@ if [ -z "$ANSWER_MODEL_PATH" ]; then
                 --input "$RAW_DATA_PATH" \
                 --output "$ANSWER_DATA_PATH" \
                 --manager-model "$ANSWER_MANAGER_PATH" \
+                --manager-adapter "${ANSWER_MANAGER_ADAPTER_PATH:-}" \
                 --manager-device "cuda" \
                 --manager-top-k 5 \
                 --per-speaker-top-k 30 \
@@ -65,7 +66,7 @@ if [ -z "$ANSWER_MODEL_PATH" ]; then
             --epochs "$EPOCHS" \
             --device "cuda"
     fi
-    ANSWER_MODEL_PATH="$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}"
+    ANSWER_ADAPTER_PATH="$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}"
 fi
 
 # ----------------------------------------------------------------------------
@@ -74,11 +75,13 @@ fi
 
 echo "Starting MemR1 Training..."
 echo "Model: $MODEL_NAME"
-echo "Answer model: $ANSWER_MODEL_PATH"
+echo "Answer base model: $MODEL_PATH"
+echo "Answer adapter: $ANSWER_ADAPTER_PATH"
 
 python3 scripts/train_manager_grpo.py \
     --manager-model "$MODEL_PATH" \
-    --answer-model "$ANSWER_MODEL_PATH" \
+    --answer-model "$MODEL_PATH" \
+    --answer-adapter "$ANSWER_ADAPTER_PATH" \
     --data-path "$DATA_PATH" \
     --output-dir "$OUTPUT_DIR" \
     --learning-rate "$LR" \

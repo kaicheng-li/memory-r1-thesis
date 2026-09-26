@@ -26,13 +26,14 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_retriever import build_answer_input
+from memfactory.lora import load_lora_model, load_reference_model, trainable_parameters
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -180,7 +181,7 @@ def grpo_step(
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_parameters(actor), 1.0)
         optimizer.step()
         loss_value = float(loss.item())
     return loss_value
@@ -188,23 +189,13 @@ def grpo_step(
 
 def train(args: argparse.Namespace) -> None:
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    actor = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=dtype).to(device)
-    actor.train()
-
-    reference = None
-    if args.beta > 0:
-        reference = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=dtype).to(device)
-        reference.eval()
-        for parameter in reference.parameters():
-            parameter.requires_grad_(False)
-
-    optimizer = torch.optim.AdamW(actor.parameters(), lr=args.learning_rate)
+    actor = load_lora_model(args.model_path, device, trainable=True)
+    reference = load_reference_model(args.model_path, device) if args.beta > 0 else None
+    optimizer = torch.optim.AdamW(trainable_parameters(actor), lr=args.learning_rate)
     samples = read_rows(args.data_path)
 
     for epoch in range(args.epochs):
@@ -248,7 +239,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.02)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--num-iterations", type=int, default=1, help="Inner GRPO update steps per rollout group")
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
     train(args)
 

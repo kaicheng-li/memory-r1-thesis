@@ -235,6 +235,8 @@ torchvision==0.24.1
 tqdm==4.67.1
 traitlets==5.14.3
 transformers==4.57.6
+peft>=0.14.0
+bitsandbytes>=0.43.0
 triton==3.5.1
 twine==6.2.0
 typer==0.21.1
