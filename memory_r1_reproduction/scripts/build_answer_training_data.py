@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,8 @@ from scripts.construct_memory_bank import (
     parse_manager_output,
     top_k_per_speaker,
 )
+
+LOGGER = logging.getLogger("memory_r1.answer_data")
 
 
 def read_json(path: str) -> Any:
@@ -46,16 +50,46 @@ def build(
     raw_samples = read_json(input_path)
     raw_samples = raw_samples if isinstance(raw_samples, list) else [raw_samples]
     dialogues = load_dialogues(raw_samples)
+    total_turns = sum(len(dialogue["turns"]) for dialogue in dialogues)
+    LOGGER.info("loaded dialogues=%d turns=%d", len(dialogues), total_turns)
     manager = Manager(manager_model, device, max_new_tokens, manager_adapter)
     rows = []
+    completed_turns = 0
 
-    for raw_sample, dialogue in zip(raw_samples, dialogues):
+    for dialogue_index, (raw_sample, dialogue) in enumerate(zip(raw_samples, dialogues), start=1):
         dialogue_id = str(dialogue["dialogue_id"])
         memory_bank: list[dict[str, Any]] = []
+        LOGGER.info(
+            "dialogue start %d/%d id=%s turns=%d",
+            dialogue_index,
+            len(dialogues),
+            dialogue_id,
+            len(dialogue["turns"]),
+        )
 
         for turn_index, turn in enumerate(dialogue["turns"]):
+            started = time.monotonic()
+            LOGGER.info(
+                "turn start dialogue=%s turn=%d/%d overall=%d/%d",
+                dialogue_id,
+                turn_index + 1,
+                len(dialogue["turns"]),
+                completed_turns + 1,
+                total_turns,
+            )
             facts = manager.extract(turn)
             if not facts:
+                completed_turns += 1
+                LOGGER.info(
+                    "turn done dialogue=%s turn=%d/%d facts=0 memory=%d elapsed=%.1fs progress=%d/%d",
+                    dialogue_id,
+                    turn_index + 1,
+                    len(dialogue["turns"]),
+                    len(memory_bank),
+                    time.monotonic() - started,
+                    completed_turns,
+                    total_turns,
+                )
                 continue
             manager_output = manager.generate(memory_bank, facts, manager_top_k)
             apply_decisions(
@@ -65,6 +99,18 @@ def build(
                 turn_index=turn_index,
                 default_speaker=turn["speaker"],
                 timestamp=turn["timestamp"],
+            )
+            completed_turns += 1
+            LOGGER.info(
+                "turn done dialogue=%s turn=%d/%d facts=%d memory=%d elapsed=%.1fs progress=%d/%d",
+                dialogue_id,
+                turn_index + 1,
+                len(dialogue["turns"]),
+                len(facts),
+                len(memory_bank),
+                time.monotonic() - started,
+                completed_turns,
+                total_turns,
             )
 
         questions = raw_sample.get("qa", raw_sample.get("questions", []))
@@ -94,8 +140,10 @@ def build(
                 }
             )
 
+        LOGGER.info("dialogue done %d/%d id=%s answer_rows=%d", dialogue_index, len(dialogues), dialogue_id, len(rows))
+
     write_jsonl(output_path, rows)
-    print(f"wrote {len(rows)} Answer tuples to {output_path}")
+    LOGGER.info("wrote %d Answer tuples to %s", len(rows), output_path)
 
 
 def main() -> None:
@@ -109,6 +157,11 @@ def main() -> None:
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
     build(
         args.input,
         args.output,

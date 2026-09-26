@@ -94,14 +94,17 @@ def top_k_per_speaker(
 
 
 def parse_manager_output(text: str) -> list[dict[str, Any]]:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("Memory Manager output does not contain JSON.")
-    payload = json.loads(text[start : end + 1])
-    decisions = payload.get("memory", [])
-    if not isinstance(decisions, list):
-        raise ValueError("Memory Manager output has no memory list.")
-    return [item for item in decisions if isinstance(item, dict)]
+    decoder = json.JSONDecoder()
+    for start, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("memory"), list):
+            return [item for item in payload["memory"] if isinstance(item, dict)]
+    raise ValueError("Memory Manager output does not contain a valid memory JSON object.")
 
 
 def apply_decisions(
@@ -192,17 +195,28 @@ class Manager:
         query = " ".join(fact["text"] for fact in facts)
         retrieved = top_k_fn(query, old_memory, top_k)
         prompt = build_manager_input(retrieved, facts)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
-        with self.torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+        for attempt in range(2):
+            retry_prompt = prompt if attempt == 0 else (
+                prompt + "\nYour previous response was invalid JSON. Return one complete JSON object "
+                'with a "memory" list. Do not include explanations or markdown.'
             )
-        prompt_length = inputs["input_ids"].shape[1]
-        return self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
+            inputs = self.tokenizer(retry_prompt, return_tensors="pt", truncation=True).to(self.device)
+            with self.torch.no_grad():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            prompt_length = inputs["input_ids"].shape[1]
+            raw = self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
+            try:
+                parse_manager_output(raw)
+                return raw
+            except (ValueError, json.JSONDecodeError) as exc:
+                if attempt:
+                    raise ValueError(f"Memory Manager returned invalid JSON: {raw!r}") from exc
 
 
 top_k_fn = top_k
@@ -246,7 +260,7 @@ def main() -> None:
     parser.add_argument("--manager-adapter")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=5)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
     construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens, args.manager_adapter)
 
