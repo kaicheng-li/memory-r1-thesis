@@ -21,6 +21,7 @@ from scripts.construct_memory_bank import (
     parse_manager_output,
     top_k_per_speaker,
 )
+from memfactory.locomo_split import select_locomo_split
 
 LOGGER = logging.getLogger("memory_r1.answer_data")
 
@@ -46,9 +47,10 @@ def build(
     manager_top_k: int,
     answer_top_k_per_speaker: int,
     max_new_tokens: int,
+    split: str,
 ) -> None:
     raw_samples = read_json(input_path)
-    raw_samples = raw_samples if isinstance(raw_samples, list) else [raw_samples]
+    raw_samples = select_locomo_split(raw_samples, split)
     dialogues = load_dialogues(raw_samples)
     total_turns = sum(len(dialogue["turns"]) for dialogue in dialogues)
     LOGGER.info("loaded dialogues=%d turns=%d", len(dialogues), total_turns)
@@ -131,6 +133,7 @@ def build(
                     "question": str(question["question"]),
                     "retrieved_memories": retrieved_memories,
                     "answer": str(question.get("answer", "")),
+                    "category": int(question.get("category", 0)),
                     "metadata": {
                         "manager_model": manager_model,
                         "manager_top_k": manager_top_k,
@@ -156,6 +159,7 @@ def main() -> None:
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--split", choices=["train", "validation", "test"], default="train")
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -171,6 +175,7 @@ def main() -> None:
         args.manager_top_k,
         args.answer_top_k_per_speaker,
         args.max_new_tokens,
+        args.split,
     )
 
 

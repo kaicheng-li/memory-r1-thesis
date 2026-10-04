@@ -23,11 +23,16 @@ ANSWER_MANAGER_PATH="${ANSWER_MANAGER_PATH:-$MODEL_PATH}"
 ANSWER_ADAPTER_PATH="${ANSWER_ADAPTER_PATH:-}"
 
 # 2. Training Hyperparameters
-LR=1e-6
-BETA=0.01
-MAX_GEN_LEN=2048
-NUM_GENS=8
-EPOCHS=5
+LR="${LR:-1e-6}"
+BETA="${BETA:-0.01}"
+ANSWER_MAX_GEN_LEN="${ANSWER_MAX_GEN_LEN:-2048}"
+MANAGER_MAX_GEN_LEN="${MANAGER_MAX_GEN_LEN:-2048}"
+ANSWER_NUM_GENS="${ANSWER_NUM_GENS:-8}"
+MANAGER_NUM_GENS="${MANAGER_NUM_GENS:-8}"
+SCORE_MICRO_BATCH="${SCORE_MICRO_BATCH:-1}"
+EPOCHS="${EPOCHS:-5}"
+NUM_GPUS="${NUM_GPUS:-1}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
 
 # ----------------------------------------------------------------------------
 # 1) Train the Answer Agent (Section 3.3) on Algorithm 2 tuples.
@@ -35,6 +40,20 @@ EPOCHS=5
 # ----------------------------------------------------------------------------
 
 cd "$(dirname "$0")/.." # Go to project root
+
+if [ "$NUM_GPUS" -gt 1 ]; then
+    TRAIN_LAUNCH=(
+        accelerate launch
+        --multi_gpu
+        --num_processes "$NUM_GPUS"
+        --num_machines 1
+        --mixed_precision no
+        --dynamo_backend no
+        --main_process_port "$MAIN_PROCESS_PORT"
+    )
+else
+    TRAIN_LAUNCH=(python3)
+fi
 
 if [ -z "$ANSWER_ADAPTER_PATH" ]; then
     if [ -f "$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}/adapter_config.json" ] && [ -z "$FORCE_ANSWER_RETRAIN" ]; then
@@ -48,19 +67,22 @@ if [ -z "$ANSWER_ADAPTER_PATH" ]; then
                 --device "cuda" \
                 --manager-top-k 5 \
                 --answer-top-k-per-speaker 30 \
-                --max-new-tokens "$MAX_GEN_LEN"
+                --max-new-tokens "$MANAGER_MAX_GEN_LEN" \
+                --split train
         fi
         echo "Training Answer Agent on $ANSWER_DATA_PATH ..."
-        python3 scripts/train_answer_grpo.py \
+        "${TRAIN_LAUNCH[@]}" scripts/train_answer_grpo.py \
             --data-path "$ANSWER_DATA_PATH" \
+            --raw-data-path "$RAW_DATA_PATH" \
             --model-path "$MODEL_PATH" \
             --output-dir "$ANSWER_OUTPUT_DIR" \
             --learning-rate "$LR" \
             --beta "$BETA" \
-            --max-new-tokens "$MAX_GEN_LEN" \
-            --num-generations "$NUM_GENS" \
-            --epochs "$EPOCHS" \
-            --device "cuda"
+            --max-prompt-tokens 4096 \
+            --max-new-tokens "$ANSWER_MAX_GEN_LEN" \
+            --num-generations "$ANSWER_NUM_GENS" \
+            --score-micro-batch "$SCORE_MICRO_BATCH" \
+            --epochs "$EPOCHS"
     fi
     ANSWER_ADAPTER_PATH="$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}"
 fi
@@ -71,18 +93,20 @@ fi
 
 echo "Starting MemR1 Training..."
 echo "Model: $MODEL_NAME"
+echo "GPUs: $NUM_GPUS"
 echo "Answer base model: $MODEL_PATH"
 echo "Answer adapter: $ANSWER_ADAPTER_PATH"
 
-python3 scripts/train_manager_grpo.py \
+"${TRAIN_LAUNCH[@]}" scripts/train_manager_grpo.py \
     --manager-model "$MODEL_PATH" \
     --answer-model "$MODEL_PATH" \
     --answer-adapter "$ANSWER_ADAPTER_PATH" \
     --data-path "$DATA_PATH" \
+    --raw-data-path "$RAW_DATA_PATH" \
     --output-dir "$OUTPUT_DIR" \
     --learning-rate "$LR" \
     --beta "$BETA" \
-    --max-new-tokens "$MAX_GEN_LEN" \
-    --num-generations "$NUM_GENS" \
-    --device "cuda" \
+    --max-prompt-tokens 4096 \
+    --max-new-tokens "$MANAGER_MAX_GEN_LEN" \
+    --num-generations "$MANAGER_NUM_GENS" \
     --epochs "$EPOCHS"

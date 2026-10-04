@@ -1,5 +1,4 @@
 import torch
-import json
 from typing import List, Dict, Any, Tuple
 from ..common.registry import MODULE_REGISTRY
 from .base import BaseModule
@@ -34,27 +33,20 @@ and output it before you answer questions.
 6. Double-check the answer correctness
 7. Ensure the final answer is specific
 8. First output the memories that you found are important before you answer questions
-Memories for user John:- 7:20 pm on 16 June, 2023: John has a special memory of a vacation to California where he experienced a
-gorgeous sunset and an enjoyable night strolling the shore, creating meaningful memories with loved ones.- 6:13 pm on 10 April, 2023: John explored the coast in the Pacific Northwest and visited some national
-parks, finding the beauty of nature absolutely breathtaking.- 3:14 pm on 13 August, 2023: John enjoys spending time outdoors with his family, including activities
-such as hiking, hanging out at the park, and having picnics. He also values indoor family activities like
-playing board games and having movie nights at home.
-... (In total 30 most relevant memories from John's Memory Bank are provided) ...
-Memories for user Maria:- 6:29 pm on 7 July, 2023: John experienced a severe flood in his old area last week, which caused
-significant damage to homes due to poor infrastructure.- 1:24 pm on 25 May, 2023: Maria appreciates the beauty of small, meaningful moments in life, as reflected
-in her reaction to a family beach photo shared by John.- 3:14 pm on 13 August, 2023: Maria appreciates family bonding and is interested in the activities that
-John and his family enjoy doing together.
-... (In total 30 most relevant memories from Maria's Memory Bank are provided) ...
-Question: Does John live close to a beach or the mountains?"""
+"""
 
 
 def build_answer_input(question: str, memories_by_speaker: Dict[str, List[Dict[str, Any]]]) -> str:
     """Attach runtime retrieved memories to the canonical Answer prompt."""
     sections = []
     for speaker, memories in memories_by_speaker.items():
+        memory_lines = "\n".join(
+            f"- {memory.get('timestamp', '')}: {memory.get('text', '')}"
+            for memory in memories
+        )
         sections.append(
             f"Memories for user {speaker}:\n"
-            f"{json.dumps(memories, ensure_ascii=False, indent=2)}\n"
+            f"{memory_lines}\n"
             f"... (In total {len(memories)} relevant memories from {speaker}'s Memory Bank are provided) ..."
         )
     return (

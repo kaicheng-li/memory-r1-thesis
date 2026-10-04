@@ -85,3 +85,62 @@ def load_reference_model(base_model_path: str, device: str):
 
 def trainable_parameters(model):
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+
+def shard_rows(rows, process_index: int, num_processes: int):
+    if num_processes == 1:
+        return rows
+    padded = list(rows)
+    padded.extend(rows[: (-len(rows)) % num_processes])
+    return padded[process_index::num_processes]
+
+
+def initialize_collectives(device: str, num_processes: int) -> None:
+    if num_processes == 1:
+        return
+
+    import torch.distributed as dist
+
+    marker = torch.zeros(1, device=device)
+    dist.all_reduce(marker, op=dist.ReduceOp.SUM)
+
+
+def average_gradients(model, num_processes: int, bucket_bytes: int = 4 * 1024 * 1024) -> None:
+    if num_processes == 1:
+        return
+
+    import torch.distributed as dist
+
+    bucket = []
+    bucket_size = 0
+
+    def reduce_bucket() -> None:
+        if not bucket:
+            return
+        gradients = [
+            parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)
+            for parameter in bucket
+        ]
+        flat_gradient = torch.cat([gradient.reshape(-1) for gradient in gradients])
+        dist.all_reduce(flat_gradient, op=dist.ReduceOp.SUM)
+        flat_gradient.div_(num_processes)
+
+        offset = 0
+        for parameter in bucket:
+            size = parameter.numel()
+            reduced = flat_gradient[offset : offset + size].view_as(parameter)
+            if parameter.grad is None:
+                parameter.grad = reduced.clone()
+            else:
+                parameter.grad.copy_(reduced)
+            offset += size
+
+    for parameter in trainable_parameters(model):
+        parameter_bytes = parameter.numel() * parameter.element_size()
+        if bucket and bucket_size + parameter_bytes > bucket_bytes:
+            reduce_bucket()
+            bucket = []
+            bucket_size = 0
+        bucket.append(parameter)
+        bucket_size += parameter_bytes
+    reduce_bucket()

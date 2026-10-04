@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 from pathlib import Path
@@ -65,15 +64,34 @@ def load_dialogues(payload: Any) -> list[dict[str, Any]]:
     return [normalize_sample(sample) for sample in samples if isinstance(sample, dict)]
 
 
-def score(query: str, memory: dict[str, Any]) -> float:
-    query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
-    memory_tokens = set(re.findall(r"[a-zA-Z0-9]+", str(memory.get("text", "")).lower()))
-    denominator = math.sqrt(len(query_tokens) * len(memory_tokens))
-    return len(query_tokens & memory_tokens) / denominator if denominator else 0.0
+_embedding_model = None
+_embedding_cache = {}
+
+
+def _embeddings(texts: list[str]):
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+
+        model_name = os.environ.get("MEMORY_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        device = os.environ.get("MEMORY_EMBEDDING_DEVICE", "cpu")
+        _embedding_model = SentenceTransformer(model_name, device=device)
+
+    missing = list(dict.fromkeys(text for text in texts if text not in _embedding_cache))
+    if missing:
+        vectors = _embedding_model.encode(missing, normalize_embeddings=True, convert_to_numpy=True)
+        _embedding_cache.update(zip(missing, vectors))
+    return [_embedding_cache[text] for text in texts]
 
 
 def top_k(query: str, memory_bank: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
-    return sorted(memory_bank, key=lambda memory: score(query, memory), reverse=True)[:k]
+    if not memory_bank:
+        return []
+    texts = [query] + [str(memory.get("text", "")) for memory in memory_bank]
+    vectors = _embeddings(texts)
+    scores = [float(vector @ vectors[0]) for vector in vectors[1:]]
+    ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
+    return [memory_bank[index] for index, _ in ranked[:k]]
 
 
 def top_k_per_speaker(

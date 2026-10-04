@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.locomo_split import select_locomo_split
 
 HISTORY_WINDOW = 24
 DEFAULT_MAX_TOKENS = 8192
@@ -106,6 +107,7 @@ def normalize_locomo_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "question": str(raw_qa.get("question", "")),
             "answer": str(answer),
             "evidence": evidence,
+            "category": int(raw_qa.get("category", 0)),
         })
 
     participants = [str(value) for key in ("speaker_a", "speaker_b") if (value := conversation.get(key))]
@@ -383,8 +385,9 @@ def build(
     api_key: str,
     max_tokens: int,
     max_retries: int,
+    split: str,
 ) -> None:
-    dialogues = load_dialogues(read_json(input_path))
+    dialogues = load_dialogues(select_locomo_split(read_json(input_path), split))
     builder = MemoryBankBuilder(cache_path, model, base_url, api_key, max_tokens, max_retries)
     rows = []
     LOGGER.info("loaded input=%s dialogues=%d", input_path, len(dialogues))
@@ -463,6 +466,7 @@ def main() -> None:
     )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--split", choices=["train", "validation", "test"], default="train")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     parser.add_argument("--log-file", help="Optional path for a persistent build log")
     args = parser.parse_args()
@@ -489,6 +493,7 @@ def main() -> None:
         args.api_key,
         args.max_tokens,
         args.max_retries,
+        args.split,
     )
 
 

@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -32,7 +33,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_updater import build_manager_input
-from memfactory.lora import load_lora_model, load_reference_model, trainable_parameters
+from memfactory.locomo_split import question_keys
+from memfactory.lora import (
+    average_gradients,
+    initialize_collectives,
+    load_lora_model,
+    shard_rows,
+    trainable_parameters,
+)
 from scripts.construct_memory_bank import (
     apply_decisions,
     parse_manager_output,
@@ -134,18 +142,37 @@ class TextModel:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.truncation_side = "left"
         self.model = load_lora_model(model_path, self.device, adapter_path, trainable)
         self.model.train(trainable)
         self.trainable = trainable
 
-    def generate(self, prompt: str, max_new_tokens: int, temperature: float) -> tuple[str, torch.Tensor]:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        max_prompt_tokens: int,
+    ) -> tuple[str, torch.Tensor]:
         """Sample a completion; returns (decoded text, raw sampled token ids).
 
         The token ids are the exact sequence the policy sampled and are kept
         so log_probability scores the actual rollout action instead of a
         re-tokenized reconstruction of the decoded text.
         """
-        inputs = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt", truncation=True).to(self.device)
+        inputs = self.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_prompt_tokens,
+        ).to(self.device)
+        was_training = self.model.training
+        was_checkpointing = self.model.is_gradient_checkpointing
+        self.model.eval()
+        if was_checkpointing:
+            self.model.gradient_checkpointing_disable()
+        self.model.config.use_cache = True
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -154,13 +181,27 @@ class TextModel:
                 temperature=max(temperature, 1e-5),
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
             )
+        self.model.config.use_cache = False
+        if was_checkpointing:
+            self.model.gradient_checkpointing_enable()
+        self.model.train(was_training)
         prompt_length = inputs["input_ids"].shape[1]
-        completion_ids = output[0][prompt_length:].clone()
+        completion_ids = output[0][prompt_length:]
+        eos_positions = (completion_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=False)
+        if len(eos_positions):
+            completion_ids = completion_ids[: int(eos_positions[0]) + 1]
+        completion_ids = completion_ids.clone()
         text = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         return text, completion_ids
 
-    def log_probability(self, prompt: str, completion_ids: torch.Tensor) -> torch.Tensor:
+    def log_probability(
+        self,
+        prompt: str,
+        completion_ids: torch.Tensor,
+        max_prompt_tokens: int,
+    ) -> torch.Tensor:
         """Token-level log probabilities over the sampled completion, shape [L'].
 
         Scores the exact token ids returned by generate(), so importance
@@ -168,16 +209,28 @@ class TextModel:
         """
         if completion_ids.numel() == 0:
             return torch.zeros((0,), device=self.device)
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+        prompt_ids = self.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_prompt_tokens,
+            return_tensors="pt",
+        )["input_ids"][0]
         input_ids = torch.cat([prompt_ids.to(self.device), completion_ids.to(self.device)]).unsqueeze(0)
         attention_mask = torch.ones_like(input_ids)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        logits = outputs.logits[:, :-1, :]
-        labels = input_ids[:, 1:]
+        causal_lm = self.model.get_base_model() if hasattr(self.model, "peft_config") else self.model
+        hidden_states = causal_lm.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        ).last_hidden_state
         start = max(prompt_ids.numel() - 1, 0)
-        completion_logits = logits[:, start : start + completion_ids.numel(), :]
-        completion_labels = labels[:, start : start + completion_ids.numel()]
-        return F.log_softmax(completion_logits, dim=-1).gather(2, completion_labels.unsqueeze(-1)).squeeze(-1)
+        action_states = hidden_states[:, start : start + completion_ids.numel(), :]
+        labels = input_ids[:, start + 1 : start + 1 + completion_ids.numel()]
+        logits = causal_lm.lm_head(action_states)
+        selected = logits.gather(2, labels.unsqueeze(-1)).squeeze(-1)
+        return (selected - torch.logsumexp(logits, dim=-1)).squeeze(0)
 
 
 
@@ -192,6 +245,7 @@ def answer_with_model_by_speaker(
     participants: list[str],
     max_new_tokens: int,
     temperature: float,
+    max_prompt_tokens: int,
 ) -> str:
     from memfactory.modules.memory_retriever import build_answer_input
 
@@ -200,7 +254,12 @@ def answer_with_model_by_speaker(
         for participant in participants
     }
     prompt = build_answer_input(question, memories_by_speaker)
-    raw, _ = answer_model.generate(prompt, max_new_tokens, temperature=temperature)
+    raw, _ = answer_model.generate(
+        prompt,
+        max_new_tokens,
+        temperature=temperature,
+        max_prompt_tokens=max_prompt_tokens,
+    )
     return raw.rsplit("Answer:", 1)[-1].strip()
 
 
@@ -210,20 +269,23 @@ def answer_with_model_by_speaker(
 
 def apply_policy_update(
     manager: TextModel,
-    reference: TextModel | None,
     optimizer: torch.optim.Optimizer,
     trajectories: list[dict[str, Any]],
     rewards: list[float],
     args: argparse.Namespace,
+    num_processes: int,
 ) -> float:
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=manager.device)
     advantages = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std(unbiased=False) + 1e-6)
     action_losses = []
     for trajectory, advantage in zip(trajectories, advantages):
-        for prompt, completion_ids, old_token_log_probs in trajectory["actions"]:
-            token_log_probs = manager.log_probability(prompt, completion_ids)  # [L']
+        for prompt, completion_ids in trajectory["actions"]:
+            token_log_probs = manager.log_probability(
+                prompt, completion_ids, args.max_prompt_tokens
+            )  # [L']
             if token_log_probs.numel() == 0:
                 continue
+            old_token_log_probs = token_log_probs.detach()
             if args.algorithm == "ppo":
                 ratio = torch.exp(token_log_probs.sum() - old_token_log_probs.sum())
                 clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
@@ -235,29 +297,38 @@ def apply_policy_update(
                 clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
                 per_token = -torch.minimum(ratio * advantage, clipped * advantage)
                 action_losses.append(per_token.mean())
-            if reference is not None:
+            if args.beta > 0:
+                was_training = manager.model.training
+                manager.model.eval()
                 with torch.no_grad():
-                    reference_log_probs = reference.log_probability(prompt, completion_ids)
+                    with manager.model.disable_adapter():
+                        reference_log_probs = manager.log_probability(
+                            prompt, completion_ids, args.max_prompt_tokens
+                        )
+                manager.model.train(was_training)
                 if reference_log_probs.numel() == 0:
                     continue
                 log_ratio = reference_log_probs - token_log_probs
                 # R1-style KL penalty k3(u) = e^u - u - 1 (u = log ref - log act), >= 0
                 action_losses[-1] = action_losses[-1] + args.beta * (log_ratio.exp() - 1 - log_ratio).mean()
-    if not action_losses:
-        return float("nan")
-    loss = torch.stack(action_losses).mean()
     optimizer.zero_grad()
-    loss.backward()
+    if action_losses:
+        loss = torch.stack(action_losses).mean()
+        loss.backward()
+        loss_value = float(loss.item())
+    else:
+        loss_value = float("nan")
+    average_gradients(manager.model, num_processes)
     torch.nn.utils.clip_grad_norm_(trainable_parameters(manager.model), 1.0)
     optimizer.step()
-    return float(loss.item())
+    return loss_value
 
 
 # ---------------------------------------------------------------------------
 # Training entry points
 # ---------------------------------------------------------------------------
 
-def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples) -> None:
+def train_from_tuples(args, manager, answer, optimizer, reward_fn, tuples, accelerator) -> None:
     """Algorithm 5 over Algorithm 1 tuples.
 
     Per tuple: M <- {}; replay every turn of the tuple's dialogue window
@@ -266,7 +337,11 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
     frozen Answer Agent over the resulting bank. One GRPO/PPO update per
     tuple over its num_generations trajectories.
     """
-    progress = tqdm(tuples, desc=f"memory-manager-{args.algorithm}")
+    progress = tqdm(
+        tuples,
+        desc=f"memory-manager-{args.algorithm}",
+        disable=not accelerator.is_local_main_process,
+    )
     for item in progress:
         questions = item["linked_questions"]
         if not questions:
@@ -296,10 +371,13 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 query = " ".join(fact["text"] for fact in facts)
                 old_memory = top_k(query, memory, args.manager_top_k)
                 prompt = build_manager_input(old_memory, facts)
-                completion, completion_ids = manager.generate(prompt, args.max_new_tokens, args.temperature)
-                with torch.no_grad():
-                    old_token_log_probs = manager.log_probability(prompt, completion_ids).detach()
-                actions.append((prompt, completion_ids, old_token_log_probs))
+                completion, completion_ids = manager.generate(
+                    prompt,
+                    args.max_new_tokens,
+                    args.temperature,
+                    args.max_prompt_tokens,
+                )
+                actions.append((prompt, completion_ids))
                 try:
                     decisions = parse_manager_output(completion)
                     apply_decisions(
@@ -335,11 +413,19 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                     item["participants"],
                     args.answer_max_new_tokens,
                     args.answer_temperature,
+                    args.max_prompt_tokens,
                 )
                 question_rewards.append(reward_fn(prediction, question["answer"]))
             rewards.append(sum(question_rewards) / len(question_rewards))
 
-        loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
+        loss = apply_policy_update(
+            manager,
+            optimizer,
+            trajectories,
+            rewards,
+            args,
+            accelerator.num_processes,
+        )
         if math.isnan(loss):
             continue
         progress.set_postfix(loss=loss, reward=float(torch.tensor(rewards).mean()))
@@ -354,8 +440,12 @@ def save_checkpoint(manager: TextModel, output_dir: Path, epoch: int) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
+    accelerator = Accelerator()
+    args.device = str(accelerator.device)
+    set_seed(args.seed)
+    initialize_collectives(args.device, accelerator.num_processes)
+
     manager = TextModel(args.manager_model, args.device, trainable=True)
-    reference = TextModel(args.manager_model, args.device, trainable=False) if args.beta else None
     answer = TextModel(args.answer_model, args.device, trainable=False, adapter_path=args.answer_adapter)
     optimizer = torch.optim.AdamW(trainable_parameters(manager.model), lr=args.learning_rate)
     reward_fn = exact_match_reward if args.reward == "em" else answer_reward
@@ -366,6 +456,14 @@ def train(args: argparse.Namespace) -> None:
             "Data must be Algorithm 1 tuples (build_manager_training_data.py output): "
             "rows have to contain 'temporal_memory_bank'/'current_turn'."
         )
+    allowed = question_keys(args.raw_data_path, args.split)
+    for row in rows:
+        dialogue_id = str(row.get("dialogue_id", "dialogue"))
+        row["linked_questions"] = [
+            question
+            for question in row.get("linked_questions", [])
+            if (dialogue_id, str(question.get("question_id", ""))) in allowed
+        ]
     tuples = normalize_tuples(rows)
     for item in tuples:
         for turn in item["dialogue_turns"]:
@@ -375,21 +473,30 @@ def train(args: argparse.Namespace) -> None:
                     f"turn {turn.get('turn_index', '?')}): data must be rebuilt "
                     "with build_manager_training_data.py (LLMExtract step)."
                 )
+    tuples = [item for item in tuples if item["linked_questions"]]
+    if accelerator.is_main_process:
+        qa_count = sum(len(item["linked_questions"]) for item in tuples)
+        print(f"LoCoMo {args.split} split: {qa_count} Manager QA pairs in {len(tuples)} tuples")
+    tuples = shard_rows(tuples, accelerator.process_index, accelerator.num_processes)
     for epoch in range(args.epochs):
-        train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples)
-        save_checkpoint(manager, Path(args.output_dir), epoch)
+        train_from_tuples(args, manager, answer, optimizer, reward_fn, tuples, accelerator)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            save_checkpoint(manager, Path(args.output_dir), epoch)
+        accelerator.wait_for_everyone()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Algorithm 5: train Memory-R1 Memory Manager.")
     parser.add_argument("--data-path", required=True, help="Algorithm 1 tuples (build_manager_training_data.py output)")
+    parser.add_argument("--raw-data-path", required=True, help="Raw LoCoMo JSON used to apply the paper split")
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--answer-model", required=True)
     parser.add_argument("--answer-adapter", required=True)
     parser.add_argument("--output-dir", default="output/memory_r1_manager")
     parser.add_argument("--algorithm", choices=["grpo", "ppo"], default="grpo")
     parser.add_argument("--reward", choices=["em", "f1"], default="em", help="Reward on the frozen answer agent's output (paper uses exact match)")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--num-generations", type=int, default=4)
@@ -399,8 +506,10 @@ def main() -> None:
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--answer-temperature", type=float, default=1.0)
+    parser.add_argument("--split", choices=["train", "validation", "test"], default="train")
     args = parser.parse_args()
     train(args)
 
