@@ -1,7 +1,7 @@
 # Core training and inference
-torch==2.9.1
-transformers==4.57.6
-accelerate==1.12.0
+transformers
+peft>=0.14.0
+bitsandbytes>=0.43.0
 vllm==0.15.1
 swanlab==0.7.6
 
@@ -19,7 +19,6 @@ pymilvus==2.6.6
 # Common model runtime helpers
 sentencepiece==0.2.1
 safetensors==0.7.0
-sentence-transformers==5.1.2
 
 # Optional acceleration for compatible CUDA environments:
 # flash-attn==2.8.3
