@@ -5,6 +5,9 @@ from __future__ import annotations
 import torch
 
 
+_CPU_SYNC_GROUP = None
+
+
 def load_lora_model(
     base_model_path: str,
     device: str,
@@ -95,14 +98,36 @@ def shard_rows(rows, process_index: int, num_processes: int):
     return padded[process_index::num_processes]
 
 
-def initialize_collectives(device: str, num_processes: int) -> None:
+def initialize_collectives(
+    device: str, num_processes: int, enable_cpu_sync: bool = False
+) -> None:
     if num_processes == 1:
         return
 
+    global _CPU_SYNC_GROUP
     import torch.distributed as dist
 
+    if enable_cpu_sync:
+        # The Manager uses this group to rendezvous before NCCL and aggregate
+        # diagnostics. Other trainers retain the original NCCL-only setup.
+        _CPU_SYNC_GROUP = dist.new_group(backend="gloo")
     marker = torch.zeros(1, device=device)
     dist.all_reduce(marker, op=dist.ReduceOp.SUM)
+
+
+def sum_cpu_scalars(values, num_processes: int) -> list[float]:
+    """Sum small diagnostic/control values without entering the NCCL group."""
+    scalars = [float(value) for value in values]
+    if num_processes == 1:
+        return scalars
+
+    import torch.distributed as dist
+
+    if _CPU_SYNC_GROUP is None:
+        raise RuntimeError("initialize_collectives() must be called before reduction")
+    tensor = torch.tensor(scalars, dtype=torch.float64, device="cpu")
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=_CPU_SYNC_GROUP)
+    return tensor.tolist()
 
 
 def average_gradients(model, num_processes: int, bucket_bytes: int = 4 * 1024 * 1024) -> None:

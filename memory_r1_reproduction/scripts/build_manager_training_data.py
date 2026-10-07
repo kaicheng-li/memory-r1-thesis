@@ -2,10 +2,13 @@
 
 For every turn t, an OpenAI-compatible teacher summarizes the preceding 24 turns into a
 temporal memory bank and extracts the turn's key facts (LLMExtract,
-Algorithm 5 line 7). The output row contains the bank, the window turns
-(preceding 24 + the current turn, each carrying its extracted facts, replayed
-by Algorithm 5), the current turn, and QA pairs linked to that turn. It
-contains no memory-operation labels.
+Algorithm 5 line 7). This is one Algorithm 1 temporal tuple. The output row
+contains the bank, the window turns (preceding 24 + the current turn, each
+carrying its extracted facts, replayed by Algorithm 5), the current turn, and
+the QA pairs linked to that turn. It contains no memory-operation labels.
+
+Algorithm 5 later pairs this temporal tuple with each linked (question, answer)
+pair. Therefore the number of QA pairs is not the number of Manager actions.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -93,6 +97,20 @@ def normalize_locomo_sample(sample: dict[str, Any]) -> dict[str, Any]:
         evidence = raw_qa.get("evidence", [])
         if isinstance(evidence, str):
             evidence = [evidence]
+        normalized_evidence = []
+        for item in evidence:
+            item_text = str(item)
+            # LoCoMo releases use several equivalent encodings: a list of
+            # IDs, semicolon-separated IDs, and space-separated IDs.  Extract
+            # the dialogue IDs uniformly so QA-to-turn linking is lossless.
+            ids = re.findall(r"\bD\d+:\d+\b", item_text)
+            if ids:
+                normalized_evidence.extend(ids)
+            else:
+                normalized_evidence.extend(
+                    part.strip() for part in item_text.split(";") if part.strip()
+                )
+        evidence = normalized_evidence
         turn_index = raw_qa.get("turn_index")
         if turn_index is None:
             turn_index = next((evidence_to_index.get(str(item)) for item in evidence if str(item) in evidence_to_index), None)

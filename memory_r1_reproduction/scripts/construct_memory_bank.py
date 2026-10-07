@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.chat import tokenize_chat_prompt
 from memfactory.lora import load_lora_model
 
 
@@ -125,6 +126,19 @@ def parse_manager_output(text: str) -> list[dict[str, Any]]:
     raise ValueError("Memory Manager output does not contain a valid memory JSON object.")
 
 
+COMPACT_MANAGER_RETRY = """
+Your previous response was truncated or was not valid JSON. Return ONLY one
+complete JSON object in this exact shape:
+{"memory":[...]}
+
+Return only operations that change the bank: ADD, UPDATE, or DELETE. Omit
+NONE entries. Return at most 5 operation objects, keep every text under 180
+characters, do not include old_memory, explanations, markdown, or code fences.
+For UPDATE and DELETE, preserve the existing memory id. If there is no
+change, return {"memory":[]}.
+""".strip()
+
+
 def apply_decisions(
     memory_bank: list[dict[str, Any]],
     decisions: list[dict[str, Any]],
@@ -134,7 +148,9 @@ def apply_decisions(
     timestamp: str,
 ) -> None:
     by_id = {str(memory.get("id", "")): memory for memory in memory_bank}
-    next_id = len(memory_bank)
+    next_id = max(
+        [int(memory["id"].rsplit(":m", 1)[1]) for memory in memory_bank] or [-1]
+    ) + 1
     for decision in decisions:
         event = str(decision.get("event", "NONE")).upper()
         memory_id = str(decision.get("id", ""))
@@ -159,7 +175,14 @@ def apply_decisions(
 
 
 class Manager:
-    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None):
+    def __init__(
+        self,
+        model_path: str,
+        device: str,
+        max_new_tokens: int,
+        max_prompt_tokens: int,
+        adapter_path: str | None = None,
+    ):
         import torch
         from transformers import AutoTokenizer
 
@@ -168,14 +191,16 @@ class Manager:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.truncation_side = "left"
         self.model = load_lora_model(model_path, self.device, adapter_path=adapter_path, trainable=False)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
+        self.max_prompt_tokens = max_prompt_tokens
 
     def extract(self, turn: dict[str, Any]) -> list[dict[str, Any]]:
         """LLMExtract(di) at deployment: the trained manager extracts the turn's facts."""
         prompt = build_extract_input(turn)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        inputs = tokenize_chat_prompt(self.tokenizer, prompt, self.max_prompt_tokens).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -213,12 +238,9 @@ class Manager:
         query = " ".join(fact["text"] for fact in facts)
         retrieved = top_k_fn(query, old_memory, top_k)
         prompt = build_manager_input(retrieved, facts)
-        for attempt in range(2):
-            retry_prompt = prompt if attempt == 0 else (
-                prompt + "\nYour previous response was invalid JSON. Return one complete JSON object "
-                'with a "memory" list. Do not include explanations or markdown.'
-            )
-            inputs = self.tokenizer(retry_prompt, return_tensors="pt", truncation=True).to(self.device)
+        for attempt in range(3):
+            retry_prompt = prompt if attempt == 0 else prompt + "\n\n" + COMPACT_MANAGER_RETRY
+            inputs = tokenize_chat_prompt(self.tokenizer, retry_prompt, self.max_prompt_tokens).to(self.device)
             with self.torch.no_grad():
                 output = self.model.generate(
                     **inputs,
@@ -233,15 +255,19 @@ class Manager:
                 parse_manager_output(raw)
                 return raw
             except (ValueError, json.JSONDecodeError) as exc:
-                if attempt:
-                    raise ValueError(f"Memory Manager returned invalid JSON: {raw!r}") from exc
+                if attempt == 2:
+                    tail = raw[-1200:].replace("\n", " ")
+                    raise ValueError(
+                        "Memory Manager returned invalid JSON after 3 attempts; "
+                        f"response tail: {tail!r}"
+                    ) from exc
 
 
 top_k_fn = top_k
 
 
-def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int, adapter_path: str | None) -> None:
-    manager = Manager(model_path, device, max_new_tokens, adapter_path)
+def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int, max_prompt_tokens: int, adapter_path: str | None) -> None:
+    manager = Manager(model_path, device, max_new_tokens, max_prompt_tokens, adapter_path)
     samples = load_dialogues(read_json(input_path))
     results = []
     for sample in samples:
@@ -278,9 +304,10 @@ def main() -> None:
     parser.add_argument("--manager-adapter")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=5)
+    parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = parser.parse_args()
-    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens, args.manager_adapter)
+    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens, args.max_prompt_tokens, args.manager_adapter)
 
 
 if __name__ == "__main__":

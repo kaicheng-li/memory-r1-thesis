@@ -1,4 +1,9 @@
-"""Official LoCoMo dialogue split used by Memory-R1."""
+"""Official LoCoMo dialogue-level split used by Memory-R1.
+
+The published 1:1:8 split is a split of complete dialogues, not a random
+split of QA rows.  Keep the IDs explicit so a reordered JSON file cannot
+silently change the train/validation/test boundary.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +12,30 @@ from pathlib import Path
 from typing import Any
 
 
-SPLIT_SLICES = {
-    "train": slice(0, 1),
-    "validation": slice(1, 2),
-    "test": slice(2, 10),
+SPLIT_DIALOGUE_IDS = {
+    "train": ("conv-26",),
+    "validation": ("conv-30",),
+    "test": ("conv-41", "conv-42", "conv-43", "conv-44", "conv-47", "conv-48", "conv-49", "conv-50"),
 }
 
 
 def select_locomo_split(payload: Any, split: str) -> list[dict[str, Any]]:
     samples = payload if isinstance(payload, list) else [payload]
-    selected = samples[SPLIT_SLICES[split]]
+    if split not in SPLIT_DIALOGUE_IDS:
+        raise ValueError(f"Unknown LoCoMo split: {split}")
+
+    by_id = {
+        str(sample.get("sample_id", sample.get("dialogue_id", ""))): sample
+        for sample in samples
+        if isinstance(sample, dict)
+    }
+    expected_ids = SPLIT_DIALOGUE_IDS[split]
+    missing = [dialogue_id for dialogue_id in expected_ids if dialogue_id not in by_id]
+    if missing:
+        raise ValueError(
+            f"LoCoMo {split} split is missing dialogue IDs: {', '.join(missing)}"
+        )
+    selected = [by_id[dialogue_id] for dialogue_id in expected_ids]
     result = []
     for sample in selected:
         row = dict(sample)

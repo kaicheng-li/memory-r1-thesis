@@ -35,7 +35,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_retriever import build_answer_input
-from memfactory.locomo_split import question_keys
+from memfactory.chat import tokenize_chat_prompt
 from memfactory.lora import (
     average_gradients,
     initialize_collectives,
@@ -79,12 +79,35 @@ def read_rows(path: str) -> list[dict[str, Any]]:
     return samples
 
 
+def select_answer_split(rows: list[dict[str, Any]], split: str) -> tuple[list[dict[str, Any]], int, int]:
+    """Filter invalid tuples and optionally apply the 1:1:8 split."""
+    valid = [row for row in rows if row["memories"] and row["gold"].strip()]
+    if split == "all":
+        return valid, len(rows), len(valid)
+    train_end = int(len(valid) * 0.1 + 0.5)
+    validation_end = int(len(valid) * 0.2 + 0.5)
+    boundaries = {
+        "train": (0, train_end),
+        "validation": (train_end, validation_end),
+        "test": (validation_end, len(valid)),
+    }
+    start, end = boundaries[split]
+    return valid[start:end], len(rows), len(valid)
+
+
 def normalize_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 def extract_answer(text: str) -> str:
-    return text.rsplit("Answer:", 1)[-1].strip()
+    tagged = re.search(r"<answer>(.*?)</answer>", text, re.IGNORECASE | re.DOTALL)
+    if tagged:
+        return tagged.group(1).strip()
+    marked = re.search(r"\*\*Answer:\*\*\s*(.*)", text, re.IGNORECASE | re.DOTALL)
+    if marked:
+        return marked.group(1).strip()
+    answer = re.search(r"Answer:\s*(.*)", text, re.IGNORECASE | re.DOTALL)
+    return answer.group(1).strip() if answer else text.strip()
 
 
 def exact_match_reward(prediction: str, gold: str) -> float:
@@ -109,13 +132,7 @@ def generate_completions(
     The token ids are kept so that score_group evaluates the exact action the
     policy sampled, not a re-tokenized reconstruction of the decoded text.
     """
-    inputs = tokenizer(
-        prompt,
-        add_special_tokens=False,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_prompt_tokens,
-    ).to(device)
+    inputs = tokenize_chat_prompt(tokenizer, prompt, max_prompt_tokens).to(device)
     was_training = model.training
     was_checkpointing = model.is_gradient_checkpointing
     model.eval()
@@ -163,13 +180,7 @@ def score_group(
     Returns (log_probs, action_mask) shaped [G, L'] where L' is the longest
     completion length; positions outside a row's action region are masked.
     """
-    prompt_ids = tokenizer(
-        prompt,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_prompt_tokens,
-        return_tensors="pt",
-    )["input_ids"][0]
+    prompt_ids = tokenize_chat_prompt(tokenizer, prompt, max_prompt_tokens)["input_ids"][0]
     scores = []
     for start in range(0, len(completion_ids), micro_batch_size):
         scores.extend(score_batch(model, prompt_ids, completion_ids[start : start + micro_batch_size], device, tokenizer.pad_token_id))
@@ -231,6 +242,7 @@ def grpo_step(
     prompt: str,
     completion_ids: list[torch.Tensor],
     rewards: torch.Tensor,
+    old_log_probs: torch.Tensor,
     args: argparse.Namespace,
     num_processes: int,
 ) -> float:
@@ -250,13 +262,7 @@ def grpo_step(
         actor.train(was_training)
 
     optimizer.zero_grad()
-    prompt_ids = tokenizer(
-        prompt,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=args.max_prompt_tokens,
-        return_tensors="pt",
-    )["input_ids"][0]
+    prompt_ids = tokenize_chat_prompt(tokenizer, prompt, args.max_prompt_tokens)["input_ids"][0]
     for start in range(0, len(completion_ids), args.score_micro_batch):
         ids_batch = completion_ids[start : start + args.score_micro_batch]
         log_probs_batch = score_batch(
@@ -265,7 +271,7 @@ def grpo_step(
         chunk_losses = []
         for offset, log_probs in enumerate(log_probs_batch):
             index = start + offset
-            old = log_probs.detach()
+            old = old_log_probs[index, : len(log_probs)]
             ratio = torch.exp(log_probs - old)
             clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
             per_token = -torch.minimum(
@@ -298,15 +304,15 @@ def train(args: argparse.Namespace) -> None:
 
     actor = load_lora_model(args.model_path, device, trainable=True)
     optimizer = torch.optim.AdamW(trainable_parameters(actor), lr=args.learning_rate)
-    allowed = question_keys(args.raw_data_path, args.split)
-    all_samples = [
-        sample
-        for sample in read_rows(args.data_path)
-        if (sample["dialogue_id"], sample["question_id"]) in allowed
-    ]
+    all_samples = read_rows(args.data_path)
+    samples_for_split, raw_count, valid_count = select_answer_split(all_samples, args.split)
     if accelerator.is_main_process:
-        print(f"LoCoMo {args.split} split: {len(all_samples)} Answer QA pairs")
-    samples = shard_rows(all_samples, accelerator.process_index, accelerator.num_processes)
+        split_note = "after filtering" if args.split == "all" else "after 1:1:8 split"
+        print(
+            f"Answer data: {raw_count} raw, {valid_count} valid after filtering, "
+            f"{len(samples_for_split)} {args.split} QA pairs {split_note}"
+        )
+    samples = shard_rows(samples_for_split, accelerator.process_index, accelerator.num_processes)
 
     for epoch in range(args.epochs):
         progress = tqdm(
@@ -314,6 +320,7 @@ def train(args: argparse.Namespace) -> None:
             desc=f"answer-grpo-epoch-{epoch + 1}",
             disable=not accelerator.is_local_main_process,
         )
+        first_group_logged = False
         for sample in progress:
             memories_by_speaker = {
                 participant: [
@@ -336,6 +343,30 @@ def train(args: argparse.Namespace) -> None:
                 dtype=torch.float32,
                 device=device,
             )
+            with torch.no_grad():
+                old_log_probs, _ = score_group(
+                    actor,
+                    tokenizer,
+                    prompt,
+                    completion_ids,
+                    device,
+                    args.score_micro_batch,
+                    args.max_prompt_tokens,
+                )
+            if accelerator.is_main_process and not first_group_logged:
+                print(
+                    "Answer first group: "
+                    + json.dumps(
+                        {
+                            "gold": sample["gold"],
+                            "rewards": rewards.tolist(),
+                            "completions": decoded,
+                            "extracted": [extract_answer(text) for text in decoded],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                first_group_logged = True
             update_start = time.perf_counter()
             loss = grpo_step(
                 actor,
@@ -344,6 +375,7 @@ def train(args: argparse.Namespace) -> None:
                 prompt,
                 completion_ids,
                 rewards,
+                old_log_probs.detach(),
                 args,
                 accelerator.num_processes,
             )
@@ -351,6 +383,7 @@ def train(args: argparse.Namespace) -> None:
             progress.set_postfix(
                 loss=loss,
                 reward=float(rewards.mean().item()),
+                hits=int(rewards.sum().item()),
                 tokens=sum(len(ids) for ids in completion_ids),
                 rollout_s=round(rollout_seconds, 1),
                 update_s=round(update_seconds, 1),
@@ -369,7 +402,6 @@ def train(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO train the Memory-R1 Answer Agent (paper Section 3.3).")
     parser.add_argument("--data-path", required=True, help="Algorithm 2 tuples (build_answer_training_data.py output)")
-    parser.add_argument("--raw-data-path", required=True, help="Raw LoCoMo JSON used to apply the paper split")
     parser.add_argument("--model-path", required=True, help="Base model to initialize the Answer Agent")
     parser.add_argument("--output-dir", default="output/memory_r1_answer")
     parser.add_argument("--seed", type=int, default=42)
@@ -382,7 +414,7 @@ def main() -> None:
     parser.add_argument("--score-micro-batch", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
-    parser.add_argument("--split", choices=["train", "validation", "test"], default="train")
+    parser.add_argument("--split", choices=["all", "train", "validation", "test"], default="train")
     args = parser.parse_args()
     train(args)
 

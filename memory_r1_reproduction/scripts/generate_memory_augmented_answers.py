@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from memfactory.modules.memory_retriever import build_answer_input
+from memfactory.chat import tokenize_chat_prompt
 from memfactory.lora import load_lora_model
 from scripts.construct_memory_bank import top_k_per_speaker
 
@@ -61,11 +62,10 @@ class AnswerAgent:
             for participant in participants
         }
         prompt = build_answer_input(question, memories_by_speaker)
-        inputs = self.tokenizer(
+        inputs = tokenize_chat_prompt(
+            self.tokenizer,
             prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_prompt_tokens,
+            self.max_prompt_tokens,
         ).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(

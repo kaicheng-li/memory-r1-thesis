@@ -46,6 +46,7 @@ def build(
     device: str,
     manager_top_k: int,
     answer_top_k_per_speaker: int,
+    max_prompt_tokens: int,
     max_new_tokens: int,
     split: str,
 ) -> None:
@@ -54,7 +55,7 @@ def build(
     dialogues = load_dialogues(raw_samples)
     total_turns = sum(len(dialogue["turns"]) for dialogue in dialogues)
     LOGGER.info("loaded dialogues=%d turns=%d", len(dialogues), total_turns)
-    manager = Manager(manager_model, device, max_new_tokens, manager_adapter)
+    manager = Manager(manager_model, device, max_new_tokens, max_prompt_tokens, manager_adapter)
     rows = []
     completed_turns = 0
 
@@ -158,6 +159,7 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k-per-speaker", type=int, default=30)
+    parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--split", choices=["train", "validation", "test"], default="train")
     args = parser.parse_args()
@@ -174,6 +176,7 @@ def main() -> None:
         args.device,
         args.manager_top_k,
         args.answer_top_k_per_speaker,
+        args.max_prompt_tokens,
         args.max_new_tokens,
         args.split,
     )
