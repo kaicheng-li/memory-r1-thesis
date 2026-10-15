@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.manager_env import validate_and_apply
 from memfactory.chat import tokenize_chat_prompt
 from memfactory.lora import load_lora_model
 
@@ -126,52 +127,28 @@ def parse_manager_output(text: str) -> list[dict[str, Any]]:
     raise ValueError("Memory Manager output does not contain a valid memory JSON object.")
 
 
-COMPACT_MANAGER_RETRY = """
-Your previous response was truncated or was not valid JSON. Return ONLY one
-complete JSON object in this exact shape:
-{"memory":[...]}
-
-Return only operations that change the bank: ADD, UPDATE, or DELETE. Omit
-NONE entries. Return at most 5 operation objects, keep every text under 180
-characters, do not include old_memory, explanations, markdown, or code fences.
-For UPDATE and DELETE, preserve the existing memory id. If there is no
-change, return {"memory":[]}.
-""".strip()
-
-
 def apply_decisions(
     memory_bank: list[dict[str, Any]],
+    visible_memories: list[dict[str, Any]],
     decisions: list[dict[str, Any]],
     dialogue_id: str,
     turn_index: int,
     default_speaker: str,
     timestamp: str,
-) -> None:
-    by_id = {str(memory.get("id", "")): memory for memory in memory_bank}
-    next_id = max(
-        [int(memory["id"].rsplit(":m", 1)[1]) for memory in memory_bank] or [-1]
-    ) + 1
-    for decision in decisions:
-        event = str(decision.get("event", "NONE")).upper()
-        memory_id = str(decision.get("id", ""))
-        text = str(decision.get("text", "")).strip()
-        if event == "ADD" and text:
-            entry = {
-                "id": f"{dialogue_id}:m{next_id}",
-                "text": text,
-                "source_turn": turn_index,
-                "speaker": str(decision.get("speaker", default_speaker)),
-                "timestamp": str(decision.get("timestamp", timestamp)),
-            }
-            next_id += 1
-            memory_bank.append(entry)
-            by_id[entry["id"]] = entry
-        elif event == "UPDATE" and memory_id in by_id and text:
-            by_id[memory_id]["text"] = text
-            by_id[memory_id]["source_turn"] = turn_index
-        elif event == "DELETE" and memory_id in by_id:
-            entry = by_id.pop(memory_id)
-            memory_bank.remove(entry)
+) -> int:
+    result = validate_and_apply(
+        memory_bank,
+        visible_memories,
+        decisions,
+        dialogue_id=dialogue_id,
+        source_turn=turn_index,
+        speaker=default_speaker,
+        timestamp=timestamp,
+    )
+    if not result.valid:
+        raise ValueError(f"Invalid Memory Manager action: {result.error}")
+    memory_bank[:] = result.memory_bank
+    return result.applied_actions
 
 
 class Manager:
@@ -238,29 +215,28 @@ class Manager:
         query = " ".join(fact["text"] for fact in facts)
         retrieved = top_k_fn(query, old_memory, top_k)
         prompt = build_manager_input(retrieved, facts)
-        for attempt in range(3):
-            retry_prompt = prompt if attempt == 0 else prompt + "\n\n" + COMPACT_MANAGER_RETRY
-            inputs = tokenize_chat_prompt(self.tokenizer, retry_prompt, self.max_prompt_tokens).to(self.device)
-            with self.torch.no_grad():
-                output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            prompt_length = inputs["input_ids"].shape[1]
-            raw = self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
-            try:
-                parse_manager_output(raw)
-                return raw
-            except (ValueError, json.JSONDecodeError) as exc:
-                if attempt == 2:
-                    tail = raw[-1200:].replace("\n", " ")
-                    raise ValueError(
-                        "Memory Manager returned invalid JSON after 3 attempts; "
-                        f"response tail: {tail!r}"
-                    ) from exc
+        raw = self.generate_prompt(prompt)
+        parse_manager_output(raw)
+        return raw
+
+    def generate_prompt(self, prompt: str) -> str:
+        """Decode once; the shared transition validates the complete output."""
+        inputs = tokenize_chat_prompt(
+            self.tokenizer, prompt, self.max_prompt_tokens
+        ).to(self.device)
+        with self.torch.no_grad():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        prompt_length = inputs["input_ids"].shape[1]
+        raw = self.tokenizer.decode(
+            output[0][prompt_length:], skip_special_tokens=True
+        ).strip()
+        return raw
 
 
 top_k_fn = top_k
@@ -278,8 +254,12 @@ def construct(input_path: str, output_path: str, model_path: str, device: str, r
             if not facts:
                 continue
             output = manager.generate(memory_bank, facts, retrieval_top_k)
+            visible = top_k(
+                " ".join(fact["text"] for fact in facts), memory_bank, retrieval_top_k
+            )
             apply_decisions(
                 memory_bank,
+                visible,
                 parse_manager_output(output),
                 dialogue_id,
                 turn_index,

@@ -19,6 +19,22 @@ SPLIT_DIALOGUE_IDS = {
 }
 
 
+def questions_with_raw_ids(sample: dict[str, Any]) -> list[dict[str, Any]]:
+    """Freeze QA identity before any category filtering.
+
+    LoCoMo rows normally lack an explicit question_id.  The stable fallback is
+    the index in the raw ``qa`` array, never the index in a filtered view.
+    """
+    questions = []
+    for raw_index, question in enumerate(sample.get("qa", [])):
+        if not isinstance(question, dict):
+            continue
+        row = dict(question)
+        row["question_id"] = str(question.get("question_id", raw_index))
+        questions.append(row)
+    return questions
+
+
 def select_locomo_split(payload: Any, split: str) -> list[dict[str, Any]]:
     samples = payload if isinstance(payload, list) else [payload]
     if split not in SPLIT_DIALOGUE_IDS:
@@ -40,8 +56,7 @@ def select_locomo_split(payload: Any, split: str) -> list[dict[str, Any]]:
     for sample in selected:
         row = dict(sample)
         row["qa"] = [
-            question
-            for question in sample.get("qa", [])
+            question for question in questions_with_raw_ids(sample)
             if int(question.get("category", 0)) != 5
         ]
         result.append(row)
@@ -53,6 +68,6 @@ def question_keys(path: str, split: str) -> set[tuple[str, str]]:
     keys = set()
     for sample in select_locomo_split(payload, split):
         dialogue_id = str(sample.get("sample_id", sample.get("dialogue_id", "dialogue")))
-        for index, question in enumerate(sample.get("qa", [])):
-            keys.add((dialogue_id, str(question.get("question_id", index))))
+        for question in sample.get("qa", []):
+            keys.add((dialogue_id, str(question["question_id"])))
     return keys

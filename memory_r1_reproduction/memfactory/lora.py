@@ -26,7 +26,7 @@ def load_lora_model(
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        lora_dropout=0.05,
+        lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
@@ -105,12 +105,20 @@ def initialize_collectives(
         return
 
     global _CPU_SYNC_GROUP
+    from datetime import timedelta
+
     import torch.distributed as dist
 
     if enable_cpu_sync:
         # The Manager uses this group to rendezvous before NCCL and aggregate
         # diagnostics. Other trainers retain the original NCCL-only setup.
-        _CPU_SYNC_GROUP = dist.new_group(backend="gloo")
+        # Rank 0 runs the full roll-forward validation alone (hundreds of
+        # greedy generations, often >1 h) while the other ranks wait inside
+        # this group's all_reduce, so the default 30-minute gloo timeout
+        # would kill every multi-GPU run at the first epoch boundary.
+        _CPU_SYNC_GROUP = dist.new_group(
+            backend="gloo", timeout=timedelta(hours=12)
+        )
     marker = torch.zeros(1, device=device)
     dist.all_reduce(marker, op=dist.ReduceOp.SUM)
 

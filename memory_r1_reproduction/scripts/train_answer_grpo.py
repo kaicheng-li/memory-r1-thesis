@@ -4,7 +4,8 @@ The Answer Agent is a policy y ~ pi_ans(· | q, M_ret) that maps a question and
 its retrieved memories to an answer. Following the paper:
 
 1. For each (q, M_ret) sample G candidate answers with temperature 1.0.
-2. Score every completion with the exact-match reward R_answer = EM(y_pred, y_gold).
+2. Score every completion with continuous token F1, following Memory-R2's
+   released reward implementation. Strict EM is an evaluation diagnostic only.
 3. Normalize rewards into group-relative advantages.
 4. Update with the clipped GRPO objective plus a KL penalty against the
    reference model (beta * (exp(ref_lp - act_lp) - 1 - (ref_lp - act_lp))).
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -25,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import numpy as np
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
@@ -34,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from evaluation.metrics import exact_match, f1_score
 from memfactory.modules.memory_retriever import build_answer_input
 from memfactory.chat import tokenize_chat_prompt
 from memfactory.lora import (
@@ -41,6 +45,7 @@ from memfactory.lora import (
     initialize_collectives,
     load_lora_model,
     shard_rows,
+    sum_cpu_scalars,
     trainable_parameters,
 )
 
@@ -95,10 +100,6 @@ def select_answer_split(rows: list[dict[str, Any]], split: str) -> tuple[list[di
     return valid[start:end], len(rows), len(valid)
 
 
-def normalize_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
 def extract_answer(text: str) -> str:
     tagged = re.search(r"<answer>(.*?)</answer>", text, re.IGNORECASE | re.DOTALL)
     if tagged:
@@ -110,11 +111,23 @@ def extract_answer(text: str) -> str:
     return answer.group(1).strip() if answer else text.strip()
 
 
-def exact_match_reward(prediction: str, gold: str) -> float:
-    """R_answer = EM(y_pred, y_gold), the paper's reward for the Answer Agent."""
-    prediction_tokens = normalize_text(prediction)
-    gold_tokens = normalize_text(gold)
-    return 1.0 if prediction_tokens and prediction_tokens == gold_tokens else 0.0
+def capture_rng_state() -> dict[str, Any]:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state(state["cuda"])
 
 
 def generate_completions(
@@ -139,17 +152,18 @@ def generate_completions(
     if was_checkpointing:
         model.gradient_checkpointing_disable()
     model.config.use_cache = True
+    generation = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": temperature > 0,
+        "num_return_sequences": num_generations,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "use_cache": True,
+    }
+    if temperature > 0:
+        generation["temperature"] = temperature
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            num_return_sequences=num_generations,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True,
-        )
+        outputs = model.generate(**inputs, **generation)
     model.config.use_cache = False
     if was_checkpointing:
         model.gradient_checkpointing_enable()
@@ -239,18 +253,20 @@ def grpo_step(
     actor,
     tokenizer,
     optimizer,
+    scheduler,
     prompt: str,
     completion_ids: list[torch.Tensor],
     rewards: torch.Tensor,
-    old_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor | None,
     args: argparse.Namespace,
     num_processes: int,
-) -> float:
+) -> tuple[float, bool]:
     """One GRPO update for a group of G answers to the same (q, M_ret)."""
+    local_signal = float(rewards.std(unbiased=False).item()) > args.variance_epsilon
     advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
     loss_value = 0.0
     reference_log_probs = None
-    if args.beta > 0:
+    if local_signal and args.beta > 0:
         was_training = actor.training
         actor.eval()
         with torch.no_grad():
@@ -262,32 +278,39 @@ def grpo_step(
         actor.train(was_training)
 
     optimizer.zero_grad()
-    prompt_ids = tokenize_chat_prompt(tokenizer, prompt, args.max_prompt_tokens)["input_ids"][0]
-    for start in range(0, len(completion_ids), args.score_micro_batch):
-        ids_batch = completion_ids[start : start + args.score_micro_batch]
-        log_probs_batch = score_batch(
-            actor, prompt_ids, ids_batch, args.device, tokenizer.pad_token_id
-        )
-        chunk_losses = []
-        for offset, log_probs in enumerate(log_probs_batch):
-            index = start + offset
-            old = old_log_probs[index, : len(log_probs)]
-            ratio = torch.exp(log_probs - old)
-            clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
-            per_token = -torch.minimum(
-                ratio * advantages[index], clipped * advantages[index]
+    if local_signal:
+        if old_log_probs is None:
+            raise ValueError("old_log_probs are required for a nonzero-variance group")
+        prompt_ids = tokenize_chat_prompt(tokenizer, prompt, args.max_prompt_tokens)["input_ids"][0]
+        for start in range(0, len(completion_ids), args.score_micro_batch):
+            ids_batch = completion_ids[start : start + args.score_micro_batch]
+            log_probs_batch = score_batch(
+                actor, prompt_ids, ids_batch, args.device, tokenizer.pad_token_id
             )
-            if reference_log_probs is not None:
-                log_ratio = reference_log_probs[index, : len(ids_batch[offset])] - log_probs
-                per_token = per_token + args.beta * (log_ratio.exp() - 1 - log_ratio)
-            chunk_losses.append(per_token.mean())
-        chunk_loss = torch.stack(chunk_losses).sum() / len(completion_ids)
-        chunk_loss.backward()
-        loss_value += float(chunk_loss.detach().item())
+            chunk_losses = []
+            for offset, log_probs in enumerate(log_probs_batch):
+                index = start + offset
+                old = old_log_probs[index, : len(log_probs)]
+                ratio = torch.exp(log_probs - old)
+                clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
+                per_token = -torch.minimum(
+                    ratio * advantages[index], clipped * advantages[index]
+                )
+                if reference_log_probs is not None:
+                    log_ratio = reference_log_probs[index, : len(ids_batch[offset])] - log_probs
+                    per_token = per_token + args.beta * (log_ratio.exp() - 1 - log_ratio)
+                chunk_losses.append(per_token.mean())
+            chunk_loss = torch.stack(chunk_losses).sum() / len(completion_ids)
+            chunk_loss.backward()
+            loss_value += float(chunk_loss.detach().item())
+    global_signal = int(sum_cpu_scalars([float(local_signal)], num_processes)[0])
+    if global_signal == 0:
+        return float("nan"), False
     average_gradients(actor, num_processes)
     torch.nn.utils.clip_grad_norm_(trainable_parameters(actor), 1.0)
     optimizer.step()
-    return loss_value
+    scheduler.step()
+    return loss_value, True
 
 
 def train(args: argparse.Namespace) -> None:
@@ -295,26 +318,71 @@ def train(args: argparse.Namespace) -> None:
     device = str(accelerator.device)
     args.device = device
     set_seed(args.seed)
-    initialize_collectives(device, accelerator.num_processes)
+    initialize_collectives(device, accelerator.num_processes, enable_cpu_sync=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left"
 
-    actor = load_lora_model(args.model_path, device, trainable=True)
-    optimizer = torch.optim.AdamW(trainable_parameters(actor), lr=args.learning_rate)
+    actor = load_lora_model(
+        args.model_path,
+        device,
+        adapter_path=args.resume_from,
+        trainable=True,
+    )
+    optimizer = torch.optim.AdamW(
+        trainable_parameters(actor),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: min((step + 1) / max(args.warmup_steps, 1), 1.0),
+    )
+    start_epoch = 0
+    best_f1 = -1.0
+    best_em = -1.0
+    best_epoch = 0
+    if args.resume_from:
+        resume_dir = Path(args.resume_from)
+        state_path = resume_dir / "trainer_state.pt"
+        rng_path = resume_dir / f"rng_rank_{accelerator.process_index}.pt"
+        if not state_path.is_file() or not rng_path.is_file():
+            raise ValueError(f"Incomplete Answer checkpoint: {resume_dir}")
+        state = torch.load(
+            state_path, map_location=accelerator.device, weights_only=False
+        )
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        start_epoch = int(state["completed_epoch"])
+        best_f1 = float(state.get("best_f1", -1.0))
+        best_em = float(state.get("best_em", -1.0))
+        best_epoch = int(state.get("best_epoch", 0))
+        restore_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
     all_samples = read_rows(args.data_path)
     samples_for_split, raw_count, valid_count = select_answer_split(all_samples, args.split)
     if accelerator.is_main_process:
+        print(
+            "Answer training config: "
+            f"world_size={accelerator.num_processes}, optimizer=AdamW, "
+            f"lr={args.learning_rate:.6e}, warmup_steps={args.warmup_steps}, "
+            f"weight_decay={args.weight_decay}, reward=continuous_token_f1, "
+            f"num_generations={args.num_generations}, temperature={args.temperature}, "
+            f"max_new_tokens={args.max_new_tokens}, "
+            f"max_prompt_tokens={args.max_prompt_tokens}",
+            flush=True,
+        )
         split_note = "after filtering" if args.split == "all" else "after 1:1:8 split"
         print(
             f"Answer data: {raw_count} raw, {valid_count} valid after filtering, "
             f"{len(samples_for_split)} {args.split} QA pairs {split_note}"
         )
     samples = shard_rows(samples_for_split, accelerator.process_index, accelerator.num_processes)
-
-    for epoch in range(args.epochs):
+    validation_samples = (
+        read_rows(args.validation_data_path) if args.validation_data_path else []
+    )
+    for epoch in range(start_epoch, args.epochs):
         progress = tqdm(
             samples,
             desc=f"answer-grpo-epoch-{epoch + 1}",
@@ -339,20 +407,22 @@ def train(args: argparse.Namespace) -> None:
             decoded = [text for text, _ in completions]
             completion_ids = [ids for _, ids in completions]
             rewards = torch.tensor(
-                [exact_match_reward(extract_answer(text), sample["gold"]) for text in decoded],
+                [f1_score(extract_answer(text), sample["gold"]) for text in decoded],
                 dtype=torch.float32,
                 device=device,
             )
-            with torch.no_grad():
-                old_log_probs, _ = score_group(
-                    actor,
-                    tokenizer,
-                    prompt,
-                    completion_ids,
-                    device,
-                    args.score_micro_batch,
-                    args.max_prompt_tokens,
-                )
+            old_log_probs = None
+            if float(rewards.std(unbiased=False).item()) > args.variance_epsilon:
+                with torch.no_grad():
+                    old_log_probs, _ = score_group(
+                        actor,
+                        tokenizer,
+                        prompt,
+                        completion_ids,
+                        device,
+                        args.score_micro_batch,
+                        args.max_prompt_tokens,
+                    )
             if accelerator.is_main_process and not first_group_logged:
                 print(
                     "Answer first group: "
@@ -368,49 +438,116 @@ def train(args: argparse.Namespace) -> None:
                 )
                 first_group_logged = True
             update_start = time.perf_counter()
-            loss = grpo_step(
+            loss, did_step = grpo_step(
                 actor,
                 tokenizer,
                 optimizer,
+                scheduler,
                 prompt,
                 completion_ids,
                 rewards,
-                old_log_probs.detach(),
+                old_log_probs.detach() if old_log_probs is not None else None,
                 args,
                 accelerator.num_processes,
             )
             update_seconds = time.perf_counter() - update_start
             progress.set_postfix(
                 loss=loss,
+                stepped=did_step,
                 reward=float(rewards.mean().item()),
-                hits=int(rewards.sum().item()),
+                reward_nonzero=int((rewards > 0).sum().item()),
                 tokens=sum(len(ids) for ids in completion_ids),
                 rollout_s=round(rollout_seconds, 1),
                 update_s=round(update_seconds, 1),
             )
 
-        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             output_dir = Path(args.output_dir) / f"epoch_{epoch + 1}"
             output_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
             print(f"saved Answer Agent checkpoint to {output_dir}")
-        accelerator.wait_for_everyone()
+            if validation_samples:
+                records = []
+                for sample in validation_samples:
+                    memories_by_speaker = {
+                        participant: [
+                            memory for memory in sample["memories"]
+                            if memory["speaker"] == participant
+                        ]
+                        for participant in sample["participants"]
+                    }
+                    prompt = build_answer_input(sample["question"], memories_by_speaker)
+                    completion = generate_completions(
+                        actor, tokenizer, prompt, 1, args.max_new_tokens, 0.0,
+                        device, args.max_prompt_tokens,
+                    )[0][0]
+                    prediction = extract_answer(completion)
+                    records.append({
+                        "dialogue_id": sample["dialogue_id"],
+                        "question_id": sample["question_id"],
+                        "gold": sample["gold"],
+                        "prediction": prediction,
+                        "em": exact_match(prediction, sample["gold"]),
+                        "f1": f1_score(prediction, sample["gold"]),
+                    })
+                val_em = sum(row["em"] for row in records) / len(records)
+                val_f1 = sum(row["f1"] for row in records) / len(records)
+                eval_path = Path(args.output_dir) / "evaluation" / f"epoch_{epoch + 1}.json"
+                eval_path.parent.mkdir(parents=True, exist_ok=True)
+                eval_path.write_text(json.dumps({
+                    "epoch": epoch + 1,
+                    "summary": {"qa": len(records), "em": val_em, "f1": val_f1},
+                    "records": records,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(
+                    f"Answer validation epoch {epoch + 1}: EM={val_em:.4f} "
+                    f"F1={val_f1:.4f}", flush=True,
+                )
+                if val_f1 > best_f1 or (val_f1 == best_f1 and val_em > best_em):
+                    best_f1, best_em, best_epoch = val_f1, val_em, epoch + 1
+                    (Path(args.output_dir) / "best_checkpoint.json").write_text(
+                        json.dumps({
+                            "epoch": best_epoch,
+                            "path": str(output_dir),
+                            "validation_f1": best_f1,
+                            "validation_em": best_em,
+                        }, indent=2), encoding="utf-8",
+                    )
+            torch.save({
+                "completed_epoch": epoch + 1,
+                "best_f1": best_f1,
+                "best_em": best_em,
+                "best_epoch": best_epoch,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+            }, output_dir / "trainer_state.pt")
+        sum_cpu_scalars([0.0], accelerator.num_processes)
+        torch.save(
+            capture_rng_state(),
+            Path(args.output_dir) / f"epoch_{epoch + 1}" /
+            f"rng_rank_{accelerator.process_index}.pt",
+        )
+        sum_cpu_scalars([0.0], accelerator.num_processes)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO train the Memory-R1 Answer Agent (paper Section 3.3).")
     parser.add_argument("--data-path", required=True, help="Algorithm 2 tuples (build_answer_training_data.py output)")
+    parser.add_argument("--validation-data-path", help="Separate validation tuples")
     parser.add_argument("--model-path", required=True, help="Base model to initialize the Answer Agent")
     parser.add_argument("--output-dir", default="output/memory_r1_answer")
+    parser.add_argument("--resume-from", help="Complete Answer checkpoint directory")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
-    parser.add_argument("--num-generations", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.02)
+    parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
+    parser.add_argument("--variance-epsilon", type=float, default=1e-12)
     parser.add_argument("--score-micro-batch", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)

@@ -203,15 +203,6 @@ class AuditModel:
         return text, token_count, hit_token_limit
 
 
-def parse_manager_payload(text: str) -> list[dict[str, Any]]:
-    # Keep offline audit parsing identical to Algorithm 3/4 construction.
-    # Both paths accept a JSON object containing a list under ``memory`` and
-    # tolerate assistant prefixes/fences before the object.
-    from scripts.construct_memory_bank import parse_manager_output
-
-    return parse_manager_output(text)
-
-
 def operations_are_valid(
     decisions: list[dict[str, Any]], memory: list[dict[str, Any]]
 ) -> tuple[bool, list[str]]:
@@ -361,8 +352,8 @@ def audit_manager(args: argparse.Namespace) -> dict[str, Any]:
     # The embedding retriever is only required for Manager replay. Keeping the
     # import here avoids loading sentence-transformers for --help/Answer audit.
     from scripts.construct_memory_bank import (
-        COMPACT_MANAGER_RETRY,
         apply_decisions,
+        parse_manager_output,
         top_k,
         top_k_per_speaker,
     )
@@ -428,14 +419,13 @@ def audit_manager(args: argparse.Namespace) -> dict[str, Any]:
                     "turn_index": int(turn.get("turn_index", turn_index)),
                     "completion_tokens": token_count,
                     "hit_token_limit": hit_limit,
-                    "manager_attempts": 1,
                     "manager_elapsed_s": manager.last_elapsed_s,
                     "search_elapsed_s": search_elapsed,
                     "json_valid": False,
                     "operations_valid": False,
                 }
                 try:
-                    decisions = parse_manager_payload(raw)
+                    decisions = parse_manager_output(raw)
                     action["json_valid"] = True
                     semantic_valid, semantic_errors = operations_are_valid(
                         decisions, old_memory
@@ -444,6 +434,7 @@ def audit_manager(args: argparse.Namespace) -> dict[str, Any]:
                     action["operation_errors"] = semantic_errors
                     apply_decisions(
                         memory,
+                        old_memory,
                         decisions,
                         str(item["dialogue_id"]),
                         int(turn.get("turn_index", turn_index)),
@@ -451,51 +442,11 @@ def audit_manager(args: argparse.Namespace) -> dict[str, Any]:
                         str(turn.get("timestamp", "")),
                     )
                 except (ValueError, json.JSONDecodeError) as exc:
-                    # Match construct_memory_bank.py: a truncated/non-JSON
-                    # response gets a compact, operation-only retry before the
-                    # trajectory is declared invalid.
-                    action["initial_parse_error"] = str(exc)
-                    action["initial_raw_output"] = raw
-                    retry_prompt = prompt + "\n\n" + COMPACT_MANAGER_RETRY
-                    retry_raw, retry_tokens, retry_hit_limit = manager.generate(
-                        retry_prompt,
-                        args.max_prompt_tokens,
-                        args.max_new_tokens,
-                        args.temperature,
-                        stable_seed(
-                            args.seed,
-                            "manager-retry",
-                            row_index,
-                            generation_index,
-                            turn_index,
-                        ),
-                    )
-                    action["manager_attempts"] = 2
-                    action["completion_tokens"] = retry_tokens
-                    action["hit_token_limit"] = hit_limit or retry_hit_limit
-                    action["manager_elapsed_s"] += manager.last_elapsed_s
-                    try:
-                        decisions = parse_manager_payload(retry_raw)
-                        action["json_valid"] = True
-                        semantic_valid, semantic_errors = operations_are_valid(
-                            decisions, old_memory
-                        )
-                        action["operations_valid"] = semantic_valid
-                        action["operation_errors"] = semantic_errors
-                        apply_decisions(
-                            memory,
-                            decisions,
-                            str(item["dialogue_id"]),
-                            int(turn.get("turn_index", turn_index)),
-                            str(turn.get("speaker", "")),
-                            str(turn.get("timestamp", "")),
-                        )
-                    except (ValueError, json.JSONDecodeError) as retry_exc:
-                        trajectory_complete = False
-                        action["parse_error"] = str(retry_exc)
-                        action["raw_output"] = retry_raw
-                        actions.append(action)
-                        break
+                    trajectory_complete = False
+                    action["parse_error"] = str(exc)
+                    action["raw_output"] = raw
+                    actions.append(action)
+                    break
                 actions.append(action)
 
             prediction = ""

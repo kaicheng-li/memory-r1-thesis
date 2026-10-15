@@ -10,6 +10,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from memfactory.locomo_split import questions_with_raw_ids
+
 
 LOCOMO_CATEGORY_NAMES = {
     1: "multi_hop",
@@ -29,11 +31,11 @@ def normalize_text(text: str) -> str:
 
 
 def f1_score(prediction: str, gold: str) -> float:
-    """Token F1 used by the Memory-R1 LoCoMo evaluator.
+    """LoCoMo token F1 used for evaluation and the Memory-R2-style RL reward.
 
-    Memory-R1's released evaluator counts unique overlapping token values but
-    keeps the original token-list lengths in the precision/recall denominators.
-    This differs from the later Memory-R2 multiset scorer.
+    The overlap numerator counts unique token values, while precision and
+    recall retain the original token-list lengths. Keeping this implementation
+    here makes training, prechecks, and evaluation use one definition.
     """
     prediction_tokens = normalize_text(prediction).split()
     gold_tokens = normalize_text(gold).split()
@@ -82,9 +84,9 @@ def load_question_metadata(raw_data_path: str | None) -> dict[tuple[str, str], d
     metadata = {}
     for sample in samples:
         dialogue_id = str(sample.get("sample_id", sample.get("dialogue_id", "")))
-        for index, question in enumerate(sample.get("qa", [])):
+        for question in questions_with_raw_ids(sample):
             category = int(question.get("category", 0))
-            metadata[(dialogue_id, str(question.get("question_id", index)))] = {
+            metadata[(dialogue_id, str(question["question_id"]))] = {
                 "category": category,
                 "category_name": LOCOMO_CATEGORY_NAMES.get(category, "unknown"),
             }
