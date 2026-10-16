@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.chat import DEFAULT_MAX_PROMPT_TOKENS, tokenize_chat_prompt
 from memfactory.lora import load_lora_model
 from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve
 
@@ -65,7 +66,8 @@ def load_dialogues(payload: Any) -> list[dict[str, Any]]:
 
 
 class Manager:
-    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None):
+    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None,
+                 max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS):
         import torch
         from transformers import AutoTokenizer
 
@@ -77,11 +79,12 @@ class Manager:
         self.model = load_lora_model(model_path, self.device, adapter_path=adapter_path, trainable=False)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
+        self.max_prompt_tokens = max_prompt_tokens
 
     def extract(self, turn: dict[str, Any]) -> list[dict[str, Any]]:
-        """LLMExtract(di) at deployment: the trained manager extracts the turn's facts."""
+        """Legacy coupled extraction; use cached fixed-extractor facts for controlled experiments."""
         prompt = build_extract_input(turn)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        inputs = tokenize_chat_prompt(self.tokenizer, prompt, self.max_prompt_tokens).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -119,7 +122,7 @@ class Manager:
         query = " ".join(fact["text"] for fact in facts)
         retrieved = retrieve(query, old_memory, top_k)
         prompt = build_manager_input(retrieved, facts)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        inputs = tokenize_chat_prompt(self.tokenizer, prompt, self.max_prompt_tokens).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -131,29 +134,56 @@ class Manager:
         prompt_length = inputs["input_ids"].shape[1]
         return self.tokenizer.decode(output[0][prompt_length:], skip_special_tokens=True).strip()
 
-def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int, max_new_tokens: int, adapter_path: str | None) -> None:
-    manager = Manager(model_path, device, max_new_tokens, adapter_path)
+def construct(input_path: str, output_path: str, model_path: str, device: str, retrieval_top_k: int,
+              max_new_tokens: int, adapter_path: str | None,
+              max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
+              fact_source: str = "cached") -> None:
+    if fact_source not in {"cached", "manager"}:
+        raise ValueError("fact_source must be cached or manager")
     samples = load_dialogues(read_json(input_path))
+    if fact_source == "cached":
+        for sample in samples:
+            for turn in sample.get("turns", []):
+                if not isinstance(turn.get("facts"), list):
+                    raise ValueError(
+                        "Cached-fact evaluation requires facts on every turn; provide a fixed-extractor "
+                        "dialogue timeline. --fact-source manager is a separate, coupled-extractor condition."
+                    )
+    manager = Manager(model_path, device, max_new_tokens, adapter_path, max_prompt_tokens)
     results = []
     for sample in samples:
         dialogue_id = str(sample.get("dialogue_id", "dialogue"))
         memory_bank = []
+        invalid_actions = 0
         for turn_index, turn in enumerate(sample.get("turns", [])):
-            facts = manager.extract(turn)
+            facts = turn["facts"] if fact_source == "cached" else manager.extract(turn)
+            facts = [fact for fact in facts if isinstance(fact, dict) and str(fact.get("text", "")).strip()]
             if not facts:
                 continue
             output = manager.generate(memory_bank, facts, retrieval_top_k)
-            apply_decisions(
-                memory_bank,
-                parse_manager_output(output),
-                dialogue_id,
-                turn,
-            )
+            query = " ".join(str(fact.get("text", "")) for fact in facts)
+            visible_memory_ids = {
+                entry["id"]
+                for entry in retrieve(query, memory_bank, retrieval_top_k)
+            }
+            try:
+                apply_decisions(
+                    memory_bank,
+                    parse_manager_output(output),
+                    dialogue_id,
+                    turn,
+                    visible_memory_ids=visible_memory_ids,
+                )
+            except (ValueError, KeyError, TypeError):
+                invalid_actions += 1
         results.append({
             "dialogue_id": dialogue_id,
             "participants": sample.get("participants", []),
             "memory_bank": memory_bank,
+            "fact_source": fact_source,
+            "invalid_actions": invalid_actions,
         })
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {len(results)} memory banks to {output_path}")
@@ -165,11 +195,15 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--manager-adapter")
+    parser.add_argument("--fact-source", choices=["cached", "manager"], default="cached",
+                        help="cached fixes extractor outputs across checkpoints; manager enables legacy coupled extraction.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
     args = parser.parse_args()
-    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k, args.max_new_tokens, args.manager_adapter)
+    construct(args.input, args.output, args.manager_model, args.device, args.retrieval_top_k,
+              args.max_new_tokens, args.manager_adapter, args.max_prompt_tokens, args.fact_source)
 
 
 if __name__ == "__main__":

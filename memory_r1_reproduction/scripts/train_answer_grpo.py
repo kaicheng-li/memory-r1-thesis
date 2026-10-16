@@ -26,14 +26,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, set_seed
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from memfactory.modules.memory_retriever import build_answer_input
+from memfactory.modules.memory_retriever import build_answer_input_from_memories
 from memfactory.lora import load_lora_model, load_reference_model, trainable_parameters
+from memfactory.chat import DEFAULT_MAX_PROMPT_TOKENS, tokenize_chat_prompt
+from memfactory.locomo_split import SPLIT_DIALOGUE_IDS
+from memfactory.run_metadata import write_run_metadata
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -52,13 +55,18 @@ def read_rows(path: str) -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row, dict):
             continue
+        metadata = row.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
         question = row.get("question", row.get("query", ""))
         if not question:
             continue
         samples.append(
             {
+                "dialogue_id": str(row.get("dialogue_id", "")),
+                "split": row.get("split", metadata.get("split")),
                 "question": str(question),
                 "memories": row.get("retrieved_memories", row.get("memory_bank", [])),
+                "participants": row.get("participants"),
                 "gold": str(row.get("answer", row.get("gold_answer", ""))),
             }
         )
@@ -90,31 +98,49 @@ def generate_completions(
     max_new_tokens: int,
     temperature: float,
     device: str,
+    max_prompt_tokens: int,
 ) -> list[tuple[str, torch.Tensor]]:
     """Sample G answers; returns (decoded text, raw sampled token ids) pairs.
 
     The token ids are kept so that score_group evaluates the exact action the
     policy sampled, not a re-tokenized reconstruction of the decoded text.
     """
-    inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt", truncation=True).to(device)
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            num_return_sequences=num_generations,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+    if temperature != 1.0:
+        raise ValueError("Training samples must use temperature=1 to match raw policy log probabilities.")
+    inputs = tokenize_chat_prompt(tokenizer, prompt, max_prompt_tokens).to(device)
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_k=0,
+                top_p=1.0,
+                typical_p=1.0,
+                repetition_penalty=1.0,
+                no_repeat_ngram_size=0,
+                num_return_sequences=num_generations,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+    finally:
+        model.train(was_training)
     prompt_length = inputs["input_ids"].shape[1]
-    return [
-        (
-            tokenizer.decode(output[prompt_length:], skip_special_tokens=True).strip(),
-            output[prompt_length:].clone(),
-        )
-        for output in outputs
-    ]
+    completions = []
+    for output in outputs:
+        ids = output[prompt_length:]
+        # HF pads the batch after each row's EOS; these padding tokens were
+        # never sampled actions and must not enter the policy objective.
+        if tokenizer.eos_token_id is not None:
+            ends = (ids == tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if ends.numel():
+                ids = ids[: int(ends[0]) + 1]
+        ids = ids.clone()
+        completions.append((tokenizer.decode(ids, skip_special_tokens=True).strip(), ids))
+    return completions
 
 
 def score_group(
@@ -123,13 +149,14 @@ def score_group(
     prompt: str,
     completion_ids: list[torch.Tensor],
     device: str,
+    max_prompt_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Token-level log probabilities over the sampled completion token ids.
 
     Returns (log_probs, action_mask) shaped [G, L'] where L' is the longest
     completion length; positions outside a row's action region are masked.
     """
-    prompt_ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+    prompt_ids = tokenize_chat_prompt(tokenizer, prompt, max_prompt_tokens)["input_ids"][0]
     rows = []
     for ids in completion_ids:
         ids = ids.to(device)
@@ -145,10 +172,18 @@ def score_group(
         attention[index, offset:] = 1
         action_mask[index, offset + len(prompt_ids):] = True
 
-    outputs = model(input_ids=batch_input, attention_mask=attention, use_cache=False)
-    logits = outputs.logits[:, :-1, :]  # position p predicts token p + 1
-    labels = batch_input[:, 1:]
-    log_probs = F.log_softmax(logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
+    was_training = model.training
+    model.eval()
+    try:
+        position_ids = attention.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(attention == 0, 0)
+        outputs = model(input_ids=batch_input, attention_mask=attention,
+                        position_ids=position_ids, use_cache=False)
+        logits = outputs.logits[:, :-1, :]  # position p predicts token p + 1
+        labels = batch_input[:, 1:]
+        log_probs = F.log_softmax(logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)
+    finally:
+        model.train(was_training)
     return log_probs, action_mask[:, 1:].to(log_probs.device)
 
 
@@ -164,16 +199,23 @@ def grpo_step(
     args: argparse.Namespace,
 ) -> float:
     """One GRPO update for a group of G answers to the same (q, M_ret)."""
-    advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
+    reward_std = rewards.std(unbiased=False)
+    if len(rewards) < 2 or float(reward_std.item()) <= args.variance_epsilon:
+        return float("nan")
+    advantages = (rewards - rewards.mean()) / (reward_std + 1e-6)
     loss_value = 0.0
     for _ in range(args.num_iterations):
-        log_probs, action_mask = score_group(actor, tokenizer, prompt, completion_ids, args.device)
+        log_probs, action_mask = score_group(
+            actor, tokenizer, prompt, completion_ids, args.device, args.max_prompt_tokens
+        )
         ratio = torch.exp(log_probs - old_log_probs)
         clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
         per_token = -torch.minimum(ratio * advantages.view(-1, 1), clipped * advantages.view(-1, 1))
         if reference is not None:
             with torch.no_grad():
-                reference_log_probs, _ = score_group(reference, tokenizer, prompt, completion_ids, args.device)
+                reference_log_probs, _ = score_group(
+                    reference, tokenizer, prompt, completion_ids, args.device, args.max_prompt_tokens
+                )
             log_ratio = reference_log_probs - log_probs
             per_token = per_token + args.beta * (log_ratio.exp() - 1 - log_ratio)
         per_token = per_token * action_mask
@@ -188,7 +230,28 @@ def grpo_step(
 
 
 def train(args: argparse.Namespace) -> None:
+    if args.temperature != 1.0 or args.num_generations < 2:
+        raise ValueError("Answer GRPO requires temperature=1 and at least two generations.")
+    set_seed(args.seed)
+    samples = read_rows(args.data_path)
+    if any(not isinstance(item["participants"], list) for item in samples):
+        raise ValueError(
+            "Answer training tuples lack participants; rebuild them with "
+            "build_answer_training_data.py so training and reward prompts agree."
+        )
+    if not getattr(args, "allow_nontrain_dialogues", False):
+        permitted = set(SPLIT_DIALOGUE_IDS["train"])
+        unexpected = sorted({
+            item["dialogue_id"] for item in samples
+            if item["dialogue_id"] not in permitted or item["split"] != "train"
+        })
+        if unexpected:
+            raise ValueError(
+                "Answer training data contains non-train or unlabeled dialogues: "
+                + ", ".join(unexpected)
+            )
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -196,14 +259,17 @@ def train(args: argparse.Namespace) -> None:
     actor = load_lora_model(args.model_path, device, trainable=True)
     reference = load_reference_model(args.model_path, device) if args.beta > 0 else None
     optimizer = torch.optim.AdamW(trainable_parameters(actor), lr=args.learning_rate)
-    samples = read_rows(args.data_path)
+    write_run_metadata(args)
 
     for epoch in range(args.epochs):
         progress = tqdm(samples, desc=f"answer-grpo-epoch-{epoch + 1}")
         for sample in progress:
-            prompt = build_answer_input(sample["question"], {"Memory Bank": sample["memories"]})
+            prompt = build_answer_input_from_memories(
+                sample["question"], sample["memories"], sample["participants"]
+            )
             completions = generate_completions(
-                actor, tokenizer, prompt, args.num_generations, args.max_new_tokens, args.temperature, device
+                actor, tokenizer, prompt, args.num_generations, args.max_new_tokens,
+                args.temperature, device, args.max_prompt_tokens,
             )
             decoded = [text for text, _ in completions]
             completion_ids = [ids for _, ids in completions]
@@ -213,7 +279,9 @@ def train(args: argparse.Namespace) -> None:
                 device=device,
             )
             with torch.no_grad():
-                old_log_probs, _ = score_group(actor, tokenizer, prompt, completion_ids, device)
+                old_log_probs, _ = score_group(
+                    actor, tokenizer, prompt, completion_ids, device, args.max_prompt_tokens
+                )
             old_log_probs = old_log_probs.detach()
 
             loss = grpo_step(actor, reference, tokenizer, optimizer, prompt, completion_ids, rewards, old_log_probs, args)
@@ -229,10 +297,12 @@ def train(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO train the Memory-R1 Answer Agent (paper Section 3.3).")
     parser.add_argument("--data-path", required=True, help="Algorithm 2 tuples (build_answer_training_data.py output)")
+    parser.add_argument("--allow-nontrain-dialogues", action="store_true")
     parser.add_argument("--model-path", required=True, help="Base model to initialize the Answer Agent")
     parser.add_argument("--output-dir", default="output/memory_r1_answer")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--num-generations", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -240,6 +310,8 @@ def main() -> None:
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--num-iterations", type=int, default=1, help="Inner GRPO update steps per rollout group")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
+    parser.add_argument("--variance-epsilon", type=float, default=1e-6)
     args = parser.parse_args()
     train(args)
 

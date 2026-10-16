@@ -81,10 +81,14 @@ New Memory:
 
 def build_manager_input(old_memory: List[Dict[str, Any]], retrieved_facts: List[Any]) -> str:
     """Attach runtime memory and facts to the canonical Manager prompt."""
+    public_memory = [
+        {key: item[key] for key in ("id", "text", "speaker", "timestamp") if key in item}
+        for item in old_memory
+    ]
     return (
         f"{UPDATE_MEMORY_PROMPT}\n\n"
         "Old Memory:\n"
-        f"{json.dumps(old_memory, ensure_ascii=False, indent=2)}\n\n"
+        f"{json.dumps(public_memory, ensure_ascii=False, indent=2)}\n\n"
         "Retrieved facts:\n"
         f"{json.dumps(retrieved_facts, ensure_ascii=False, indent=2)}\n\n"
         "Return only the JSON object with the key \"memory\"."

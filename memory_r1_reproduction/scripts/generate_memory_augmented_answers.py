@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from memfactory.modules.memory_retriever import build_answer_input
+from memfactory.modules.memory_retriever import build_answer_input_from_memories
 from memfactory.lora import load_lora_model
+from memfactory.chat import DEFAULT_MAX_PROMPT_TOKENS, tokenize_chat_prompt
 from memfactory.memory_runtime import retrieve_per_speaker
 
 
@@ -28,19 +29,25 @@ def raw_questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
     for index, item in enumerate(questions):
         if not isinstance(item, dict):
             continue
+        if "category" in item and int(item["category"]) not in {1, 2, 3, 4}:
+            continue
         question = item.get("question", item.get("query", ""))
         if not question:
             continue
+        gold = item.get("answer", item.get("gold_answer", ""))
+        if isinstance(gold, list):
+            gold = ", ".join(str(value) for value in gold)
         result.append({
             "question_id": str(item.get("question_id", index)),
             "question": str(question),
-            "answer": str(item.get("answer", item.get("gold_answer", ""))),
+            "answer": str(gold),
         })
     return result
 
 
 class AnswerAgent:
-    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None):
+    def __init__(self, model_path: str, device: str, max_new_tokens: int, adapter_path: str | None = None,
+                 max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS):
         import torch
         from transformers import AutoTokenizer
 
@@ -52,10 +59,11 @@ class AnswerAgent:
         self.model = load_lora_model(model_path, self.device, adapter_path=adapter_path, trainable=False)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
+        self.max_prompt_tokens = max_prompt_tokens
 
-    def answer(self, question: str, memories: list[dict[str, Any]]) -> tuple[str, str]:
-        prompt = build_answer_input(question, {"Memory Bank": memories})
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+    def answer(self, question: str, memories: list[dict[str, Any]], participants: list[str]) -> tuple[str, str]:
+        prompt = build_answer_input_from_memories(question, memories, participants)
+        inputs = tokenize_chat_prompt(self.tokenizer, prompt, self.max_prompt_tokens).to(self.device)
         with self.torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -70,14 +78,16 @@ class AnswerAgent:
         return answer, raw
 
 
-def generate(input_path: str, memory_bank_path: str, output_path: str, answer_model: str, answer_adapter: str | None, device: str, retrieval_top_k: int, max_new_tokens: int) -> None:
+def generate(input_path: str, memory_bank_path: str, output_path: str, answer_model: str, answer_adapter: str | None,
+             device: str, retrieval_top_k: int, max_new_tokens: int,
+             max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS) -> None:
     samples = read_json(input_path)
     samples = samples if isinstance(samples, list) else [samples]
     memory_banks = {
         str(item["dialogue_id"]): item
         for item in read_json(memory_bank_path)
     }
-    agent = AnswerAgent(answer_model, device, max_new_tokens, answer_adapter)
+    agent = AnswerAgent(answer_model, device, max_new_tokens, answer_adapter, max_prompt_tokens)
     rows = []
     for sample in samples:
         dialogue_id = str(sample.get("sample_id", sample.get("dialogue_id", "dialogue")))
@@ -86,7 +96,7 @@ def generate(input_path: str, memory_bank_path: str, output_path: str, answer_mo
         participants = memory_record["participants"]
         for question in raw_questions(sample):
             retrieved = retrieve_per_speaker(question["question"], bank, participants, retrieval_top_k)
-            answer, raw_output = agent.answer(question["question"], retrieved)
+            answer, raw_output = agent.answer(question["question"], retrieved, participants)
             rows.append({
                 "dialogue_id": dialogue_id,
                 "question_id": question["question_id"],
@@ -111,8 +121,10 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--retrieval-top-k", type=int, default=30, help="Top-k memories per participant.")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
     args = parser.parse_args()
-    generate(args.input, args.memory_bank, args.output, args.answer_model, args.answer_adapter, args.device, args.retrieval_top_k, args.max_new_tokens)
+    generate(args.input, args.memory_bank, args.output, args.answer_model, args.answer_adapter,
+             args.device, args.retrieval_top_k, args.max_new_tokens, args.max_prompt_tokens)
 
 
 if __name__ == "__main__":

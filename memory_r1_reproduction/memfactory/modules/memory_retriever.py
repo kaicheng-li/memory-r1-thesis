@@ -52,6 +52,10 @@ def build_answer_input(question: str, memories_by_speaker: Dict[str, List[Dict[s
     """Attach runtime retrieved memories to the canonical Answer prompt."""
     sections = []
     for speaker, memories in memories_by_speaker.items():
+        memories = [
+            {key: item[key] for key in ("id", "text", "speaker", "timestamp") if key in item}
+            for item in memories
+        ]
         sections.append(
             f"Memories for user {speaker}:\n"
             f"{json.dumps(memories, ensure_ascii=False, indent=2)}\n"
@@ -62,6 +66,23 @@ def build_answer_input(question: str, memories_by_speaker: Dict[str, List[Dict[s
         + "\n\n".join(sections)
         + f"\n\nQuestion: {question}\n"
     )
+
+
+def build_answer_input_from_memories(
+    question: str,
+    memories: List[Dict[str, Any]],
+    participants: List[str],
+) -> str:
+    """Use one speaker-grouped prompt without training-only provenance labels."""
+    by_speaker = {
+        speaker: [
+            item
+            for item in memories
+            if item.get("speaker") == speaker
+        ]
+        for speaker in participants
+    }
+    return build_answer_input(question, by_speaker)
 
 @MODULE_REGISTRY.register("naive_retriever")
 class NaiveRetriever(BaseModule):

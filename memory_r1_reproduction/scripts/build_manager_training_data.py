@@ -1,11 +1,11 @@
 """Build Memory Manager training tuples directly from raw LoCoMo JSON.
 
-For every turn t, NVIDIA NIM summarizes the preceding 24 turns into a
-temporal memory bank and extracts the turn's key facts (LLMExtract,
-Algorithm 5 line 7). The output row contains the bank, the window turns
-(preceding 24 + the current turn, each carrying its extracted facts, replayed
-by Algorithm 5), the current turn, and QA pairs linked to that turn. It
-contains no memory-operation labels.
+For every turn t, NVIDIA NIM extracts key facts (LLMExtract, Algorithm 5
+line 7). The output row contains the window turns (preceding 24 + the
+current turn), the current turn, and QA pairs linked to that turn. An
+optional teacher-built temporal bank is retained for compatibility, but
+the sequential trainer and Answer tuple builder replay from an empty bank
+and do not consume it.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 from memfactory.modules.memory_extractor import build_extract_input
 from memfactory.modules.memory_updater import build_manager_input
+from memfactory.locomo_split import SPLIT_DIALOGUE_IDS, select_locomo_split
 
 HISTORY_WINDOW = 24
 DEFAULT_MAX_TOKENS = 8192
@@ -109,6 +110,7 @@ def normalize_locomo_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "turn_index": max(evidence_turn_indices),
             "question": str(raw_qa.get("question", "")),
             "answer": str(answer),
+            "category": int(raw_qa.get("category", 0)),
             "evidence": evidence,
             "evidence_turn_indices": evidence_turn_indices,
         })
@@ -118,6 +120,7 @@ def normalize_locomo_sample(sample: dict[str, Any]) -> dict[str, Any]:
         participants = list(dict.fromkeys(turn["speaker"] for turn in turns if turn["speaker"]))
     return {
         "dialogue_id": str(sample.get("sample_id", sample.get("dialogue_id", "dialogue"))),
+        "split": sample.get("_split"),
         "participants": participants,
         "turns": turns,
         "questions": questions,
@@ -364,10 +367,23 @@ class NvidiaMemoryBankBuilder:
         return memories
 
 
-def build(input_path: str, output_path: str, cache_path: str, model: str, max_tokens: int, max_retries: int) -> None:
-    dialogues = load_dialogues(read_json(input_path))
+def build(
+    input_path: str,
+    output_path: str,
+    cache_path: str,
+    model: str,
+    max_tokens: int,
+    max_retries: int,
+    split: str,
+    include_temporal_bank: bool = False,
+) -> None:
+    selected = select_locomo_split(read_json(input_path), split)
+    for sample in selected:
+        sample["_split"] = split
+    dialogues = load_dialogues(selected)
     builder = NvidiaMemoryBankBuilder(cache_path, model, max_tokens, max_retries)
     rows = []
+    omitted_questions: list[dict[str, Any]] = []
     LOGGER.info("loaded input=%s dialogues=%d", input_path, len(dialogues))
 
     for dialogue_index, dialogue in enumerate(dialogues, start=1):
@@ -392,7 +408,10 @@ def build(input_path: str, output_path: str, cache_path: str, model: str, max_to
         for turn_index, current_turn in enumerate(turns):
             LOGGER.info("memory progress dialogue=%s turn=%d/%d", dialogue_id, turn_index + 1, len(turns))
             start = max(0, turn_index - HISTORY_WINDOW)
-            memory_bank = builder.build(dialogue_id, turn_index, turns[start:turn_index])
+            memory_bank = (
+                builder.build(dialogue_id, turn_index, turns[start:turn_index])
+                if include_temporal_bank else []
+            )
             window_turn_ids = {turn["dia_id"] for turn in turns[start : turn_index + 1]}
             linked_questions = [
                 question
@@ -400,6 +419,16 @@ def build(input_path: str, output_path: str, cache_path: str, model: str, max_to
                 if question["turn_index"] == turn_index
                 and set(question["evidence"]).issubset(window_turn_ids)
             ]
+            omitted_questions.extend(
+                {
+                    "dialogue_id": dialogue_id,
+                    "question_id": question["question_id"],
+                    "evidence_span": max(question["evidence_turn_indices"]) - min(question["evidence_turn_indices"]),
+                }
+                for question in dialogue.get("questions", [])
+                if question["turn_index"] == turn_index
+                and not set(question["evidence"]).issubset(window_turn_ids)
+            )
             window_turns = []
             for window_index in range(start, turn_index + 1):
                 window_turn = dict(turns[window_index])
@@ -409,6 +438,7 @@ def build(input_path: str, output_path: str, cache_path: str, model: str, max_to
             rows.append(
                 {
                     "dialogue_id": dialogue_id,
+                    "split": split,
                     "turn_index": turn_index,
                     "participants": dialogue.get("participants", []),
                     "temporal_memory_bank": memory_bank,
@@ -419,18 +449,36 @@ def build(input_path: str, output_path: str, cache_path: str, model: str, max_to
                         "memory_builder": model,
                         "fact_extractor": model,
                         "history_window": HISTORY_WINDOW,
+                        "temporal_memory_bank_built": include_temporal_bank,
+                        "split": split,
                     },
                 }
             )
         LOGGER.info("dialogue done id=%s tuples=%d", dialogue_id, len(turns))
 
     write_jsonl(output_path, rows)
+    manifest = {
+        "split": split,
+        "dialogues": list(SPLIT_DIALOGUE_IDS[split]),
+        "rows": len(rows),
+        "linked_questions": sum(len(row["linked_questions"]) for row in rows),
+        "omitted_out_of_window": omitted_questions,
+    }
+    manifest_path = Path(output_path).with_suffix(".manifest.json")
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("wrote %d Manager tuples to %s", len(rows), output_path)
+    LOGGER.warning(
+        "split=%s linked_questions=%d omitted_out_of_window=%d manifest=%s",
+        split, manifest["linked_questions"], len(omitted_questions), manifest_path,
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build Memory Manager training data.")
     parser.add_argument("--input", required=True)
+    parser.add_argument("--split", required=True, choices=list(SPLIT_DIALOGUE_IDS))
+    parser.add_argument("--include-temporal-bank", action="store_true",
+                        help="Also call the teacher to summarize prior turns; not used by sequential training.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--model", default="openai/gpt-oss-20b")
@@ -453,7 +501,8 @@ def main() -> None:
         parser.error("--max-tokens must be positive")
     if args.max_retries < 0:
         parser.error("--max-retries cannot be negative")
-    build(args.input, args.output, args.cache, args.model, args.max_tokens, args.max_retries)
+    build(args.input, args.output, args.cache, args.model, args.max_tokens,
+          args.max_retries, args.split, args.include_temporal_bank)
 
 
 if __name__ == "__main__":

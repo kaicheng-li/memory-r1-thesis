@@ -23,7 +23,11 @@ def load_lora_model(
     config = LoraConfig(
         r=8,
         lora_alpha=16,
-        lora_dropout=0.05,
+        # Rollout and log-probability scoring must implement the same policy.
+        # Keep adapter dropout disabled; generation/scoring already run in
+        # eval mode and the experiment should not add another stochastic
+        # source to the GRPO ratio.
+        lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
