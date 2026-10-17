@@ -7,6 +7,7 @@ import json
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from memfactory.retrieval import retrieval_config
 
 PROMPT_CONTRACT = "speaker_grouped_public_memory_v2"
 
@@ -19,10 +20,10 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def write_run_metadata(args) -> dict:
+def write_run_metadata(args, write=True) -> dict:
     root = Path(__file__).resolve().parents[1]
     packages = {}
-    for name in ("torch", "transformers", "peft", "bitsandbytes"):
+    for name in ("torch", "transformers", "peft", "bitsandbytes", "sentence-transformers"):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
@@ -42,10 +43,18 @@ def write_run_metadata(args) -> dict:
         for path in sorted(Path(adapter).glob("*")):
             if path.is_file() and (path.suffix in {".safetensors", ".bin"} or path.name == "adapter_config.json"):
                 adapter_files[path.name] = file_sha256(path)
+    manager_adapter_files = {}
+    if getattr(args, "manager_adapter", None):
+        for path in sorted(Path(args.manager_adapter).glob("*")):
+            if path.is_file() and (path.suffix in {".safetensors", ".bin"} or path.name == "adapter_config.json"):
+                manager_adapter_files[path.name] = file_sha256(path)
     payload = {
+        "manager_adapter_sha256": manager_adapter_files,
+        "retrieval": retrieval_config(),
+        "reward_definition": "baseline_lora_unique_overlap_f1_v1",
         "prompt_contract": PROMPT_CONTRACT,
         "data_sha256": file_sha256(args.data_path),
-        "config": vars(args),
+        "config": {k: v for k, v in vars(args).items() if not k.startswith("_")},
         "commit": commit,
         "dirty_worktree": dirty,
         "packages": packages,
@@ -55,6 +64,8 @@ def write_run_metadata(args) -> dict:
             if getattr(args, "validation_timelines", None) else None
         ),
     }
+    if not write:
+        return payload
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     (output / "run_manifest.json").write_text(

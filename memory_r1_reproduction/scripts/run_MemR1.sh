@@ -8,7 +8,7 @@ set -euo pipefail
 # 1. Paths
 # DATA_PATH must be Algorithm 1 tuples (build_manager_training_data.py
 # output): per-turn episodes with 24 preceding turns plus the current turn.
-DATA_PATH="${DATA_PATH:-./data/manager_training_data_evidence.jsonl}"
+DATA_PATH="${DATA_PATH:-./data/review/manager_tuples_train_fullprefix.jsonl}"
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-7B-Instruct}"
 MODEL_PATH="${MODEL_PATH:-/home/models/${MODEL_NAME}}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/mem_r1_lora_evidence_${MODEL_NAME}}"
@@ -18,7 +18,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output/mem_r1_lora_evidence_${MODEL_NAME}}"
 ANSWER_DATA_PATH="${ANSWER_DATA_PATH:-./data/answer_training_data_evidence.jsonl}"
 ANSWER_OUTPUT_DIR="${ANSWER_OUTPUT_DIR:-./output/mem_r1_lora_evidence_answer_${MODEL_NAME}}"
 ANSWER_MANAGER_PATH="${ANSWER_MANAGER_PATH:-$MODEL_PATH}"
-# Optional explicit override; otherwise the last Answer Agent adapter is used.
+# Reuse ONE explicit frozen Answer adapter across the experiment matrix.
+# Bootstrap is available only when explicitly requested with BOOTSTRAP_ANSWER=1.
 ANSWER_ADAPTER_PATH="${ANSWER_ADAPTER_PATH:-}"
 
 # 2. Training Hyperparameters
@@ -31,7 +32,7 @@ EPOCHS="${EPOCHS:-5}"
 EVIDENCE_WEIGHT="${EVIDENCE_WEIGHT:-0.5}"
 TERMINAL_POTENTIAL="${TERMINAL_POTENTIAL:-observed}"
 GAMMA="${GAMMA:-1.0}"
-QA_REWARD="${QA_REWARD:-em}"
+QA_REWARD="${QA_REWARD:-f1}"
 ANSWER_TOP_K_PER_SPEAKER="${ANSWER_TOP_K_PER_SPEAKER:-30}"
 VALIDATION_TIMELINES="${VALIDATION_TIMELINES:-./data/stage0/dialogue_timelines_validation.json}"
 
@@ -48,6 +49,22 @@ if [ ! -f "$DATA_PATH" ]; then
     exit 1
 fi
 
+CONTROL_GATE="${CONTROL_GATE:-threshold}"
+ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-noop}"
+SHAPING_MODE="${SHAPING_MODE:-dense}"
+export MEMORY_RETRIEVAL_BACKEND="${MEMORY_RETRIEVAL_BACKEND:-minilm}"
+export MEMORY_EMBEDDING_MODEL="${MEMORY_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+extra_args=()
+if [ "$CONTROL_GATE" = threshold ]; then
+    : "${CONTROL_THRESHOLD:?Calibrate CONTROL_THRESHOLD using scripts/precheck_sequential.py on train data}"
+    extra_args+=(--control-threshold "$CONTROL_THRESHOLD")
+fi
+if [ -n "${RESUME:-}" ]; then extra_args+=(--resume "$RESUME"); fi
+if [ -n "${MANAGER_ADAPTER_PATH:-}" ]; then extra_args+=(--manager-adapter "$MANAGER_ADAPTER_PATH"); fi
+if [ -z "$ANSWER_ADAPTER_PATH" ] && [ "${BOOTSTRAP_ANSWER:-0}" != 1 ]; then
+    echo "Set ANSWER_ADAPTER_PATH to the shared frozen Answer adapter; explicit bootstrap: BOOTSTRAP_ANSWER=1." >&2
+    exit 1
+fi
 if [ -z "$ANSWER_ADAPTER_PATH" ]; then
     if [ -f "$ANSWER_OUTPUT_DIR/epoch_${EPOCHS}/adapter_config.json" ] && [ -z "${FORCE_ANSWER_RETRAIN:-}" ] && [ -z "${FORCE_ANSWER_DATA:-}" ] && \
        python3 scripts/check_answer_artifact.py --output-dir "$ANSWER_OUTPUT_DIR" \
@@ -115,4 +132,14 @@ python3 scripts/train_manager_grpo.py \
     --answer-temperature 0.0 \
     --evidence-weight "$EVIDENCE_WEIGHT" \
     --terminal-potential "$TERMINAL_POTENTIAL" \
-    --gamma "$GAMMA"
+    --gamma "$GAMMA" \
+    --advantage-estimator "$ADVANTAGE_ESTIMATOR" \
+    --adv-scale "${ADV_SCALE:-1}" \
+    --adv-clip "${ADV_CLIP:-5}" \
+    --control-gate "$CONTROL_GATE" \
+    --shaping-mode "$SHAPING_MODE" \
+    --context-overflow "${CONTEXT_OVERFLOW:-compress}" \
+    --compression-tokens "${COMPRESSION_TOKENS:-256}" \
+    --group-log "${GROUP_LOG:-$OUTPUT_DIR/groups.jsonl}" \
+    --checkpoint-every "${CHECKPOINT_EVERY:-50}" \
+    "${extra_args[@]}"

@@ -1,4 +1,4 @@
-"""Stage 4: final LoCoMo test evaluation (1307 QA, paper-comparable).
+"""Stage 4: final LoCoMo test evaluation (1307 QA, local fixed split).
 
 Semantics are identical to training-time roll-forward validation:
   cached teacher facts -> best Manager greedy roll-forward builds each test
@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from evaluation.metrics import LOCOMO_CATEGORY_NAMES
+from evaluation.metrics import LOCOMO_CATEGORY_NAMES, normalize_text, exact_match, f1_score
 
 JUDGE_PROMPT = """Your task is to label an answer to a question as 'CORRECT' or 'WRONG'.
 
@@ -61,7 +61,8 @@ def resolve_adapter(explicit: str | None, output_dir: str) -> str:
         return explicit
     best = Path(output_dir) / "best_checkpoint.json"
     if best.is_file():
-        return json.loads(best.read_text(encoding="utf-8"))["path"]
+        record = json.loads(best.read_text(encoding="utf-8"))
+        return record["adapter"] if "adapter" in record else record["path"]
     epochs = sorted(
         Path(output_dir).glob("epoch_*"),
         key=lambda p: int(re.sub(r"\D", "", p.name) or 0),
@@ -74,10 +75,13 @@ def resolve_adapter(explicit: str | None, output_dir: str) -> str:
 def evaluate_dialogues(args: argparse.Namespace) -> None:
     import torch
 
-    from evaluation.audit_checkpoints import AuditModel, extract_answer
-    from evaluation.manager_validation import evaluate_roll_forward
-    from memfactory.modules.memory_retriever import build_answer_input
-    from scripts.construct_memory_bank import top_k_per_speaker
+    from scripts.train_manager_grpo import TextModel
+    from memfactory.sequential_validation import evaluate_roll_forward
+    from memfactory.oracle_reward import safe_answer
+    from memfactory.retrieval import retrieval_config
+    from transformers import set_seed
+    set_seed(args.seed)
+    args.answer_top_k = args.answer_top_k_per_speaker
 
     manager_adapter = resolve_adapter(args.manager_adapter, args.manager_output_dir)
     answer_adapter = resolve_adapter(args.answer_adapter, args.answer_output_dir)
@@ -95,28 +99,15 @@ def evaluate_dialogues(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    manager = AuditModel(args.model_path, manager_adapter, args.device)
-    answer = AuditModel(args.model_path, answer_adapter, args.device)
+    manager = TextModel(args.model_path, args.device, False, manager_adapter, args.max_prompt_tokens)
+    answer = TextModel(args.model_path, args.device, False, answer_adapter, args.max_prompt_tokens)
 
-    def manager_generate(prompt: str) -> str:
-        return manager.generate(
-            prompt, args.max_prompt_tokens, args.max_new_tokens, 0.0, args.seed
-        )[0]
+    def manager_generate(prompt):
+        return manager.generate(prompt, args.max_new_tokens, 0.0)[0]
 
-    def answer_generate(
-        question: str, bank: list[dict[str, Any]], participants: list[str]
-    ) -> str:
-        retrieved = top_k_per_speaker(
-            question, bank, participants, args.answer_top_k_per_speaker
-        )
-        memories = {
-            p: [m for m in retrieved if m["speaker"] == p] for p in participants
-        }
-        raw = answer.generate(
-            build_answer_input(question, memories),
-            args.max_prompt_tokens, args.answer_max_new_tokens, 0.0, args.seed,
-        )[0]
-        return extract_answer(raw)
+    def answer_generate(question, memories, participants):
+        return safe_answer(answer, question, memories, participants, args.answer_max_new_tokens,
+                           args.context_overflow, args.compression_tokens)
 
     for dialogue_id in wanted:
         out_path = output_dir / f"{dialogue_id}.json"
@@ -129,7 +120,7 @@ def evaluate_dialogues(args: argparse.Namespace) -> None:
         print(f"[{dialogue_id}] roll-forward: {n_turns} turns, {n_qa} QA ...", flush=True)
         started = time.time()
         result = evaluate_roll_forward(
-            [timeline], manager_generate, answer_generate, args.manager_top_k
+            [timeline], manager_generate, answer_generate, args, normalize_text, exact_match, f1_score
         )
         result["meta"] = {
             "dialogue_id": dialogue_id,
@@ -137,6 +128,9 @@ def evaluate_dialogues(args: argparse.Namespace) -> None:
             "answer_adapter": answer_adapter,
             "model_path": args.model_path,
             "decoding": "greedy",
+            "retrieval": retrieval_config(),
+            "context_overflow": args.context_overflow,
+            "compression_tokens": args.compression_tokens,
             "elapsed_s": time.time() - started,
         }
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2),
@@ -204,6 +198,7 @@ def merge(args: argparse.Namespace) -> None:
         return {
             "n": n,
             "f1": 100 * sum(r["f1"] for r in rows) / n if n else 0.0,
+            "token_f1_multiset": 100 * sum(r["token_f1_multiset"] for r in rows) / n if n else 0.0,
             "bleu1": 100 * sum(r["bleu1"] for r in rows) / n if n else 0.0,
             "em": 100 * sum(r["em"] for r in rows) / n if n else 0.0,
             "judge": (100 * sum(r["judge"] for r in judged) / len(judged))
@@ -228,7 +223,7 @@ def merge(args: argparse.Namespace) -> None:
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     o = summary["overall"]
-    print(f"\n=== LoCoMo test (paper Table-1 comparable, percent) ===")
+    print(f"\n=== LoCoMo test (local fixed split, percent) ===")
     print(f"QA={o['n']}  F1={o['f1']:.2f}  B1={o['bleu1']:.2f}  "
           f"EM={o['em']:.2f}  J={o['judge'] if o['judge'] is not None else '-'}")
 
@@ -251,6 +246,8 @@ def main() -> None:
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
+    parser.add_argument("--context-overflow", choices=["compress", "error"], default="compress")
+    parser.add_argument("--compression-tokens", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--merge", action="store_true")

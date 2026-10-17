@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import math
 import json
 import sys
@@ -24,6 +25,16 @@ from memfactory.modules.memory_retriever import (
 from scripts.build_answer_training_data import build_rows, raw_questions
 from scripts.train_manager_grpo import apply_policy_update, train_from_tuples, potential_shaping_rewards, evidence_potential
 from memfactory.modules.memory_updater import build_manager_input
+
+
+def setUpModule():
+    global _retrieval_patch
+    _retrieval_patch = patch.dict(os.environ, {"MEMORY_RETRIEVAL_BACKEND": "lexical"})
+    _retrieval_patch.start()
+
+
+def tearDownModule():
+    _retrieval_patch.stop()
 
 
 class ManagerRuntimeTests(unittest.TestCase):

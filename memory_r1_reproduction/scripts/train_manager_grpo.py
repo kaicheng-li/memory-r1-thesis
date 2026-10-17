@@ -8,7 +8,7 @@ Per tuple
 the manager starts from an empty bank (M <- {}) and replays every turn of the
 tuple's dialogue window — retrieve with the turn's facts -> manager op ->
 apply; the frozen Answer Agent then answers the linked questions with the
-resulting bank — the exact-match reward on its answers is the training
+resulting bank — the configured F1/EM reward on its answers is the training
 signal. The Answer tuple builder replays the same windows with a frozen
 initial Manager, without consuming the optional teacher temporal bank.
 """
@@ -40,6 +40,9 @@ from memfactory.chat import DEFAULT_MAX_PROMPT_TOKENS, tokenize_chat_prompt
 from memfactory.locomo_split import SPLIT_DIALOGUE_IDS
 from memfactory.run_metadata import write_run_metadata
 from memfactory.sequential_validation import load_validation_timelines, evaluate_roll_forward
+from evaluation.metrics import normalize_text, exact_match as exact_match_reward, f1_score as answer_reward
+from memfactory.oracle_reward import (safe_answer, extract_answer, gold_text, evaluate_controls, ContextBudgetError,
+                                      estimate_advantages, append_jsonl)
 from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve, retrieve_per_speaker
 
 
@@ -64,6 +67,8 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Algorithm 1 rows -> (dialogue_turns, temporal_memory_bank, current_turn, linked_questions)."""
     normalized = []
     for row in rows:
+        if row.get("initial_bank"):
+            raise ValueError("This trainer defines the noop baseline at an empty initial bank; nonempty initial_bank is unsupported")
         metadata = row.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         normalized.append({
@@ -82,30 +87,6 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Rewards
 # ---------------------------------------------------------------------------
-
-def normalize_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
-def exact_match_reward(prediction: str, gold: str) -> float:
-    """Paper's reward: R = EM(y_pred, y_gold)."""
-    prediction_tokens = normalize_text(prediction)
-    gold_tokens = normalize_text(gold)
-    return 1.0 if prediction_tokens and prediction_tokens == gold_tokens else 0.0
-
-
-def answer_reward(prediction: str, gold: str) -> float:
-    prediction_tokens = normalize_text(prediction).split()
-    gold_tokens = normalize_text(gold).split()
-    if not gold_tokens:
-        return 0.0
-    if prediction_tokens == gold_tokens:
-        return 1.0
-    overlap = len(set(prediction_tokens) & set(gold_tokens))
-    precision = overlap / len(prediction_tokens) if prediction_tokens else 0.0
-    recall = overlap / len(gold_tokens)
-    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-
 
 def evidence_ids(question: dict[str, Any]) -> set[str]:
     """Return source turn ids supplied by LoCoMo QA annotations."""
@@ -137,6 +118,14 @@ def potential_shaping_rewards(
         rewards.append(gamma * current - previous)
         previous = current
     return rewards
+
+
+def coverage_rewards(potentials, gamma=1.0, mode="dense", terminal_potential="observed"):
+    if mode == "dense":
+        return potential_shaping_rewards(potentials, gamma, terminal_potential)
+    if mode != "terminal" or gamma != 1.0 or terminal_potential != "observed":
+        raise ValueError("Terminal-only coverage requires gamma=1 and observed boundary")
+    return [0.0] * (len(potentials) - 1) + [potentials[-1]] if potentials else []
 
 
 def evidence_potential(
@@ -246,9 +235,14 @@ def answer_with_model(
     max_new_tokens: int,
     temperature: float,
 ) -> str:
+    if hasattr(answer_model, "tokenizer"):
+        return safe_answer(answer_model, question, memories, participants, max_new_tokens,
+                           getattr(answer_model, "context_overflow", "compress"),
+                           getattr(answer_model, "compression_tokens", 256))["prediction"]
+    # Minimal model doubles for runtime contract tests.
     prompt = build_answer_input_from_memories(question, memories, participants)
     raw, _ = answer_model.generate(prompt, max_new_tokens, temperature=temperature)
-    return raw.rsplit("Answer:", 1)[-1].strip()
+    return extract_answer(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +267,7 @@ def apply_policy_update(
         returns.append(trajectory_returns)
 
     eligible_actions = []
+    update_groups = []
     action_positions = sorted({
         action["turn_position"]
         for trajectory in trajectories
@@ -292,13 +287,15 @@ def apply_policy_update(
             dtype=torch.float32,
             device=manager.device,
         )
-        reward_std = local_rewards.std(unbiased=False)
-        variance_epsilon = getattr(args, "variance_epsilon", 1e-6)
-        # Chosen convention: skip both the group policy term and standalone
-        # reference regularization when there is no relative reward signal.
-        if len(active) < 2 or float(reward_std.item()) <= variance_epsilon:
+        advantages, skip = estimate_advantages(
+            local_rewards, getattr(args, "advantage_estimator", "grpo"),
+            trajectories[0].get("noop_baseline", 0.0),
+            getattr(args, "adv_scale", 1.0), getattr(args, "adv_clip", 5.0),
+            getattr(args, "variance_epsilon", 1e-6))
+        update_groups.append({"turn_position": position, "returns": local_rewards.tolist(),
+                              "advantages": advantages.tolist(), "skipped": skip})
+        if skip:
             continue
-        advantages = (local_rewards - local_rewards.mean()) / (reward_std + 1e-6)
         for (trajectory, _), advantage in zip(active, advantages):
             action = next(
                 action for action in trajectory["actions"]
@@ -306,6 +303,7 @@ def apply_policy_update(
             )
             if action["completion_ids"].numel() > 0:
                 eligible_actions.append((action, advantage))
+    args._last_update = {"groups": update_groups, "eligible_actions": len(eligible_actions)}
     if not eligible_actions:
         return float("nan")
 
@@ -349,7 +347,8 @@ def apply_policy_update(
 # Training entry points
 # ---------------------------------------------------------------------------
 
-def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples) -> None:
+def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples,
+                      start_index=0, on_group_end=None) -> None:
     """Algorithm 5 over Algorithm 1 tuples.
 
     Per tuple: M <- {}; replay every turn of the tuple's dialogue window
@@ -360,12 +359,43 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
     differences are added to final QA reward. Their effect on credit depends
     on the terminal boundary and the return/advantage estimator.
     """
-    progress = tqdm(tuples, desc=f"memory-manager-{args.algorithm}")
-    for item in progress:
+    progress = tqdm(enumerate(tuples), total=len(tuples), desc=f"memory-manager-{args.algorithm}")
+    for tuple_index, item in progress:
+        if tuple_index < start_index:
+            continue
         questions = item["linked_questions"]
+        log = {"epoch": getattr(args, "_epoch", 0), "tuple_index": tuple_index,
+               "dialogue_id": item["dialogue_id"], "target_turn": item.get("turn_index"),
+               "estimator": getattr(args, "advantage_estimator", "grpo"),
+               "shaping_mode": getattr(args, "shaping_mode", "dense")}
+        def finish():
+            append_jsonl(getattr(args, "group_log", None), log)
+            if on_group_end:
+                on_group_end(tuple_index + 1)
         if not questions:
+            log["skip_reason"] = "no_questions"
+            finish()
             continue
         turns = item["dialogue_turns"]
+        controls = []
+        needs_controls = (getattr(args, "advantage_estimator", "grpo") == "noop"
+                          or getattr(args, "control_gate", "off") != "off"
+                          or getattr(args, "control_diagnostics", False))
+        if needs_controls:
+            # Greedy diagnostics must not perturb the Manager sampling RNG.
+            from memfactory.training_state import preserve_rng
+            with preserve_rng():
+                controls = evaluate_controls(answer, item, args, reward_fn)
+            log["controls"] = controls
+            questions = [q for q, control in zip(questions, controls) if control["eligible"]]
+            if not questions:
+                log["skip_reason"] = "no_eligible_questions"
+                finish()
+                continue
+        baseline = (sum(c["noop"]["score"] for c in controls if c["eligible"]) / len(questions)
+                    if controls else 0.0)
+        log["noop_baseline"] = baseline
+        log["eligible_questions"] = len(questions)
 
         trajectories = []
         for _ in range(args.num_generations):
@@ -419,6 +449,7 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 memory_states.append(copy.deepcopy(memory))
             trajectories.append(
                 {
+                    "noop_baseline": baseline,
                     "memory": memory,
                     "actions": actions,
                     "memory_states": memory_states,
@@ -454,13 +485,16 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                     for question in questions
                 ]
                 state_potentials.append(sum(next_potentials) / len(questions))
-            shaping = potential_shaping_rewards(
-                state_potentials, args.gamma, getattr(args, "terminal_potential", "observed")
-            )
+            shaping = coverage_rewards(state_potentials, args.gamma,
+                                       getattr(args, "shaping_mode", "dense"),
+                                       getattr(args, "terminal_potential", "observed"))
+            trajectory["potentials"] = state_potentials
+            trajectory["shaping"] = shaping
             for action_index, delta in enumerate(shaping):
                 turn_rewards[action_index] += args.evidence_weight * delta
 
             question_rewards = []
+            trajectory["answers"] = []
             for question in questions:
                 retrieved = retrieve_per_speaker(
                     question["question"],
@@ -468,19 +502,36 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                     item["participants"],
                     args.answer_top_k,
                 )
-                prediction = answer_with_model(
-                    answer,
-                    question["question"],
-                    retrieved,
-                    item["participants"],
-                    args.answer_max_new_tokens,
-                    args.answer_temperature,
-                )
-                question_rewards.append(reward_fn(prediction, question["answer"]))
+                if hasattr(answer, "tokenizer"):
+                    try:
+                        result = safe_answer(answer, question["question"], retrieved, item["participants"],
+                                             args.answer_max_new_tokens, getattr(args, "context_overflow", "compress"),
+                                             getattr(args, "compression_tokens", 256))
+                    except ContextBudgetError as exc:
+                        # Do not turn a decoder/input failure into a negative Manager reward.
+                        log.update(event="aborted_group", error=str(exc), calls=exc.calls,
+                                   question_id=str(question.get("question_id", "")))
+                        append_jsonl(getattr(args, "group_log", None), log)
+                        raise
+                else:
+                    result = {"prediction": answer_with_model(answer, question["question"], retrieved,
+                              item["participants"], args.answer_max_new_tokens, args.answer_temperature)}
+                score = reward_fn(result["prediction"], gold_text(question["answer"]))
+                question_rewards.append(score)
+                trajectory["answers"].append(dict(result, question_id=str(question.get("question_id", "")),
+                                                    score=score))
             turn_rewards[-1] += sum(question_rewards) / len(question_rewards)
             rewards.append(turn_rewards)
 
         loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
+        log["trajectories"] = [{"invalid_actions": tr["invalid_actions"],
+                                 "potentials": tr.get("potentials", []), "shaping": tr.get("shaping", []),
+                                 "answers": tr.get("answers", []), "rewards": reward}
+                                for tr, reward in zip(trajectories, rewards)]
+        log["update"] = getattr(args, "_last_update", {})
+        log["loss"] = None if math.isnan(loss) else loss
+        log["skip_reason"] = "no_advantage_or_action_tokens" if math.isnan(loss) else None
+        finish()
         if math.isnan(loss):
             continue
         flat_rewards = [value for row in rewards for value in row]
@@ -491,14 +542,6 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
         )
 
 
-def save_checkpoint(manager: TextModel, output_dir: Path, epoch: int) -> None:
-    directory = output_dir / f"epoch_{epoch + 1}"
-    directory.mkdir(parents=True, exist_ok=True)
-    manager.model.save_pretrained(directory)
-    manager.tokenizer.save_pretrained(directory)
-    print(f"saved Memory Manager checkpoint to {directory}")
-
-
 def train(args: argparse.Namespace) -> None:
     if args.temperature != 1.0:
         raise ValueError("Manager training requires temperature=1 to match raw policy log probabilities.")
@@ -506,6 +549,18 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("Group-relative training requires at least two generations.")
     if not 0.0 < args.gamma <= 1.0:
         raise ValueError("gamma must be in (0, 1].")
+    if args.answer_temperature != 0:
+        raise ValueError("The fixed Answer and all controls must use greedy decoding")
+    if args.advantage_estimator == "noop" and args.gamma != 1.0:
+        raise ValueError("Trajectory-noop baseline currently requires gamma=1")
+    if args.shaping_mode == "terminal" and (args.gamma != 1.0 or args.terminal_potential != "observed"):
+        raise ValueError("R3-T uses gamma=1 and observed coverage to match dense total coverage reward")
+    if args.adv_scale <= 0 or args.adv_clip <= 0 or args.variance_epsilon < 0:
+        raise ValueError("Require positive advantage scale/clip and nonnegative skip tolerance")
+    if args.control_gate == "threshold" and (args.control_threshold is None or not 0 <= args.control_threshold <= 1):
+        raise ValueError("Set --control-threshold in [0,1] using train precheck calibration")
+    if args.checkpoint_every < 1 or args.compression_tokens < 1:
+        raise ValueError("checkpoint-every and compression-tokens must be positive")
     set_seed(args.seed)
     validation = load_validation_timelines(args.validation_timelines) if args.validation_timelines else None
     rows = read_rows(args.data_path)
@@ -531,10 +586,24 @@ def train(args: argparse.Namespace) -> None:
                     f"turn {turn.get('turn_index', '?')}): data must be rebuilt "
                     "with build_manager_training_data.py (LLMExtract step)."
                 )
-    manager = TextModel(args.manager_model, args.device, trainable=True, max_prompt_tokens=args.max_prompt_tokens)
-    reference = TextModel(args.manager_model, args.device, trainable=False, max_prompt_tokens=args.max_prompt_tokens) if args.beta else None
+    from memfactory.training_state import (resume_contract, read_training_state, restore_rng,
+                                           save_training_checkpoint, preserve_rng)
+    if args.group_log is None:
+        args.group_log = str(Path(args.output_dir) / "groups.jsonl")
+    if (Path(args.output_dir) / "run_manifest.json").exists() and not args.resume:
+        raise ValueError("Output directory already contains a run; use --resume or a new output directory")
+    manifest = write_run_metadata(args, write=False)
+    contract = resume_contract(manifest)
+    state = read_training_state(args.resume, contract) if args.resume else None
+    if state and state["epoch"] >= args.epochs:
+        raise ValueError("Resume has already completed the requested epoch count")
+    manager = TextModel(args.manager_model, args.device, trainable=True,
+                        adapter_path=args.resume or args.manager_adapter, max_prompt_tokens=args.max_prompt_tokens)
+    reference = TextModel(args.manager_model, args.device, trainable=False,
+                          adapter_path=args.manager_adapter, max_prompt_tokens=args.max_prompt_tokens) if args.beta else None
     answer = TextModel(args.answer_model, args.device, trainable=False, adapter_path=args.answer_adapter,
                        max_prompt_tokens=args.max_prompt_tokens)
+    answer.context_overflow, answer.compression_tokens = args.context_overflow, args.compression_tokens
     optimizer = torch.optim.AdamW(trainable_parameters(manager.model), lr=args.learning_rate)
     write_run_metadata(args)
     reward_fn = exact_match_reward if args.reward == "em" else answer_reward
@@ -542,8 +611,9 @@ def train(args: argparse.Namespace) -> None:
         result = evaluate_roll_forward(
             validation,
             lambda prompt: manager.generate(prompt, args.max_new_tokens, 0.0)[0],
-            lambda question, memories, participants: answer_with_model(
-                answer, question, memories, participants, args.answer_max_new_tokens, 0.0
+            lambda question, memories, participants: safe_answer(
+                answer, question, memories, participants, args.answer_max_new_tokens,
+                args.context_overflow, args.compression_tokens
             ),
             args, normalize_text, exact_match_reward, answer_reward,
         )
@@ -551,27 +621,45 @@ def train(args: argparse.Namespace) -> None:
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"validation epoch={epoch}: {result['summary']}")
-        return result["summary"]["token_f1_multiset"]
+        return result["summary"]["reward_f1_unique_overlap"]
 
-    best_f1 = validate(0) if validation else None
-    if validation:
+    if state:
+        optimizer.load_state_dict(state["optimizer"])
+        restore_rng(state["rng"])
+        start_epoch, next_tuple, best = state["epoch"], state["next_tuple"], state["best"]
+        # Deduplicate by (epoch, tuple_index), respecting explicit resume events.
+        append_jsonl(args.group_log, {"event": "resume", "epoch": start_epoch,
+                                      "next_tuple": next_tuple, "checkpoint": args.resume})
+    else:
+        with preserve_rng():
+            initial_f1 = validate(0) if validation else None
+        start_epoch, next_tuple = 0, 0
+        best = {"epoch": 0, "adapter": args.manager_adapter, "reward_f1_unique_overlap": initial_f1}
+    def write_best():
         (Path(args.output_dir) / "best_checkpoint.json").write_text(
-            json.dumps({"epoch": 0, "adapter": None, "token_f1_multiset": best_f1}), encoding="utf-8"
-        )
-    for epoch in range(args.epochs):
-        train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples)
-        save_checkpoint(manager, Path(args.output_dir), epoch)
+            json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_best()
+    for epoch in range(start_epoch, args.epochs):
+        args._epoch = epoch
+        def checkpoint_group(cursor):
+            if cursor % args.checkpoint_every == 0 and cursor < len(tuples):
+                save_training_checkpoint(manager, optimizer,
+                    Path(args.output_dir) / f"epoch_{epoch}_tuple_{cursor}", epoch, cursor, best, contract)
+        train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples,
+                          start_index=next_tuple, on_group_end=checkpoint_group)
+        next_tuple = 0
         if validation:
-            f1 = validate(epoch + 1)
-            if f1 > best_f1:
-                best_f1 = f1
-                (Path(args.output_dir) / "best_checkpoint.json").write_text(json.dumps({
-                    "epoch": epoch + 1, "adapter": str(Path(args.output_dir) / f"epoch_{epoch + 1}"),
-                    "token_f1_multiset": best_f1,
-                }, indent=2), encoding="utf-8")
+            with preserve_rng():
+                f1 = validate(epoch + 1)
+            if f1 > best["reward_f1_unique_overlap"]:
+                best = {"epoch": epoch + 1, "adapter": str(Path(args.output_dir).resolve() / f"epoch_{epoch + 1}"),
+                        "reward_f1_unique_overlap": f1}
+        save_training_checkpoint(manager, optimizer, Path(args.output_dir) / f"epoch_{epoch + 1}",
+                                 epoch + 1, 0, best, contract)
+        write_best()
 
 
-def main() -> None:
+def build_parser():
     parser = argparse.ArgumentParser(description="Algorithm 5: train Memory-R1 Memory Manager.")
     parser.add_argument("--data-path", required=True, help="Algorithm 1 tuples (build_manager_training_data.py output)")
     parser.add_argument("--manager-model", required=True)
@@ -585,7 +673,7 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", default="output/memory_r1_manager")
     parser.add_argument("--algorithm", choices=["grpo", "ppo"], default="grpo")
-    parser.add_argument("--reward", choices=["em", "f1"], default="em", help="Reward on the frozen answer agent's output (paper uses exact match)")
+    parser.add_argument("--reward", choices=["em", "f1"], default="f1", help="Reward on the frozen answer agent's output (paper uses exact match)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -628,8 +716,24 @@ def main() -> None:
         default=0.5,
         help="Weight of evidence-aware per-turn potential shaping.",
     )
-    args = parser.parse_args()
-    train(args)
+    parser.add_argument("--manager-adapter", help="Shared initial Manager adapter (also initializes KL reference)")
+    parser.add_argument("--advantage-estimator", choices=["grpo", "noop"], default="noop")
+    parser.add_argument("--adv-scale", type=float, default=1.0)
+    parser.add_argument("--adv-clip", type=float, default=5.0)
+    parser.add_argument("--control-gate", choices=["off", "threshold"], default="threshold")
+    parser.add_argument("--control-threshold", type=float, help="Calibrate on train precheck; no validated default")
+    parser.add_argument("--control-diagnostics", action="store_true", help="Also run controls for ungated GRPO")
+    parser.add_argument("--context-overflow", choices=["compress", "error"], default="compress")
+    parser.add_argument("--compression-tokens", type=int, default=256)
+    parser.add_argument("--shaping-mode", choices=["dense", "terminal"], default="dense")
+    parser.add_argument("--group-log", help="JSONL group audit log; defaults to output-dir/groups.jsonl")
+    parser.add_argument("--resume", help="Trusted local checkpoint directory including training_state.pt")
+    parser.add_argument("--checkpoint-every", type=int, default=50, help="Save optimizer/RNG/cursor every N groups")
+    return parser
+
+
+def main() -> None:
+    train(build_parser().parse_args())
 
 
 if __name__ == "__main__":

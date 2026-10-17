@@ -7,9 +7,14 @@ import math
 import re
 from copy import deepcopy
 from typing import Any
+from memfactory.retrieval import retrieval_config, semantic_retrieve
 
 
 def retrieve(query: str, memory_bank: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+    if top_k <= 0:
+        return []
+    if retrieval_config()["backend"] == "minilm":
+        return semantic_retrieve(query, memory_bank, top_k)
     query_tokens = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
 
     def score(memory: dict[str, Any]) -> float:

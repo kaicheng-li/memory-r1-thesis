@@ -19,6 +19,7 @@ pymilvus==2.6.6
 
 # Common model runtime helpers
 sentencepiece==0.2.1
+sentence-transformers>=3.3,<6
 safetensors==0.7.0
 
 # Optional acceleration for compatible CUDA environments:
