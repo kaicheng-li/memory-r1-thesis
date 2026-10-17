@@ -70,10 +70,14 @@ def main():
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--manager-adapter")
     parser.add_argument("--answer-model", required=True)
-    parser.add_argument("--answer-adapter", required=True)
+    # Manager precheck follows Memory-R1's first stage: the frozen reader is
+    # the original base model. An adapter is optional for an explicitly
+    # separate ablation, but must not be required for the paper-faithful path.
+    parser.add_argument("--answer-adapter")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--reward", choices=["f1", "em"], default="f1")
+    parser.add_argument("--reward", choices=["f1", "em"], default="f1",
+                        help="Control score; defaults to baseline-lora F1. Match the Manager training reward.")
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)

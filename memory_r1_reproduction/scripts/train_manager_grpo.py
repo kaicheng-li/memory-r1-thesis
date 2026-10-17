@@ -181,19 +181,42 @@ class TextModel:
         self.model.eval()
         try:
             with torch.no_grad():
-                output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=temperature > 0,
-                    temperature=max(temperature, 1e-5),
-                    top_k=0,
-                    top_p=1.0,
-                    typical_p=1.0,
-                    repetition_penalty=1.0,
-                    no_repeat_ngram_size=0,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
+                generation = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": temperature > 0,
+                    # Valid in BOTH greedy and sampling modes: neutralize the
+                    # checkpoint's factory repetition settings (e.g. Qwen ships
+                    # repetition_penalty=1.05) so sampling matches the raw
+                    # policy that log_probability scores, and greedy stays
+                    # pure argmax.  These fields never trigger the invalid-flag
+                    # warning, so they must always be passed explicitly.
+                    "repetition_penalty": 1.0,
+                    "no_repeat_ngram_size": 0,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                }
+                if temperature > 0:
+                    generation.update({
+                        "temperature": temperature,
+                        "top_k": 0,
+                        "top_p": 1.0,
+                        "typical_p": 1.0,
+                    })
+                else:
+                    # Some Qwen checkpoints ship a generation_config.json with
+                    # sampling fields even though this call is greedy.  Recent
+                    # Transformers versions warn that temperature/top_k are
+                    # invalid in that mode.  Pass a clean per-call config so
+                    # the frozen reader and validation path are deterministic
+                    # and the warning cannot depend on the checkpoint file.
+                    configured = getattr(self.model, "generation_config", None)
+                    if configured is not None:
+                        configured = copy.deepcopy(configured)
+                        for field in ("temperature", "top_k", "top_p", "typical_p"):
+                            if hasattr(configured, field):
+                                setattr(configured, field, None)
+                        generation["generation_config"] = configured
+                output = self.model.generate(**inputs, **generation)
         finally:
             self.model.train(was_training)
         prompt_length = inputs["input_ids"].shape[1]
@@ -673,7 +696,7 @@ def build_parser():
     )
     parser.add_argument("--output-dir", default="output/memory_r1_manager")
     parser.add_argument("--algorithm", choices=["grpo", "ppo"], default="grpo")
-    parser.add_argument("--reward", choices=["em", "f1"], default="f1", help="Reward on the frozen answer agent's output (paper uses exact match)")
+    parser.add_argument("--reward", choices=["em", "f1"], default="f1", help="Reward on the frozen answer agent's output; defaults to baseline-lora F1. The paper uses EM.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
