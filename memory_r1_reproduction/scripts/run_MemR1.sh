@@ -12,15 +12,21 @@ export PYTHONUNBUFFERED=1
 
 RAW_DATA_PATH="${RAW_DATA_PATH:-./data/locomo10.json}"
 FACTS_DATA_PATH="${FACTS_DATA_PATH:-./data/manager_training_data_vllm.jsonl}"
-STAGE0_DIR="${STAGE0_DIR:-./data/stage0}"
+HISTORY_WINDOW="${HISTORY_WINDOW:-fullprefix}"
+case "$HISTORY_WINDOW" in
+    fullprefix) WINDOW_SUFFIX="" ;;
+    24) WINDOW_SUFFIX="_window24" ;;
+    *) echo "HISTORY_WINDOW must be fullprefix or 24" >&2; exit 1 ;;
+esac
+STAGE0_DIR="${STAGE0_DIR:-./data/stage0${WINDOW_SUFFIX}}"
 PRECHECK_PATH="${PRECHECK_PATH:-${STAGE0_DIR}/precheck_train_f1.json}"
 
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-7B-Instruct}"
 MODEL_PATH="${MODEL_PATH:-/home/models/${MODEL_NAME}}"
-MANAGER_OUTPUT_DIR="${MANAGER_OUTPUT_DIR:-./output/mem_r1_manager_${MODEL_NAME}}"
-ANSWER_OUTPUT_DIR="${ANSWER_OUTPUT_DIR:-./output/mem_r1_answer_${MODEL_NAME}}"
-ANSWER_TRAIN_PATH="${ANSWER_TRAIN_PATH:-./data/answer_training_${MODEL_NAME}_train.jsonl}"
-ANSWER_VAL_PATH="${ANSWER_VAL_PATH:-./data/answer_training_${MODEL_NAME}_validation.jsonl}"
+MANAGER_OUTPUT_DIR="${MANAGER_OUTPUT_DIR:-./output/mem_r1_manager${WINDOW_SUFFIX}_${MODEL_NAME}}"
+ANSWER_OUTPUT_DIR="${ANSWER_OUTPUT_DIR:-./output/mem_r1_answer${WINDOW_SUFFIX}_${MODEL_NAME}}"
+ANSWER_TRAIN_PATH="${ANSWER_TRAIN_PATH:-./data/answer_training${WINDOW_SUFFIX}_${MODEL_NAME}_train.jsonl}"
+ANSWER_VAL_PATH="${ANSWER_VAL_PATH:-./data/answer_training${WINDOW_SUFFIX}_${MODEL_NAME}_validation.jsonl}"
 
 MANAGER_EPOCHS="${MANAGER_EPOCHS:-5}"
 ANSWER_EPOCHS="${ANSWER_EPOCHS:-5}"
@@ -62,8 +68,11 @@ if [ ! -f "$STAGE0_DIR/manager_states_train.jsonl" ] || \
         --raw "$RAW_DATA_PATH" \
         --facts-jsonl "$FACTS_DATA_PATH" \
         --output-dir "$STAGE0_DIR" \
-        --splits train validation
+        --splits train validation --history-window "$HISTORY_WINDOW"
 fi
+
+# Reject accidentally reusing fullprefix states for the optional window24 run.
+python3 -c 'import json,sys; expected=None if sys.argv[1]=="fullprefix" else 24; rows=[json.loads(line) for p in sys.argv[2:] for line in open(p,encoding="utf-8") if line.strip()]; assert rows and all(r.get("history_window")==expected and all((max(0,r["target_turn"]-expected) if expected else 0)<=m["source_turn"]<r["target_turn"] for m in r["old_bank"]) for r in rows), "Stage-0 history mismatch; rebuild into a separate directory and rerun precheck"' "$HISTORY_WINDOW" "$STAGE0_DIR/manager_states_train.jsonl" "$STAGE0_DIR/manager_states_validation.jsonl"
 
 if [ ! -f "$PRECHECK_PATH" ]; then
     echo "Missing Stage-0.5 precheck: $PRECHECK_PATH" >&2

@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
 from evaluation.metrics import exact_match, f1_score
 from memfactory.modules.memory_retriever import build_answer_input
 from memfactory.chat import tokenize_chat_prompt
+from memfactory.progress import append_progress
 from memfactory.lora import (
     average_gradients,
     initialize_collectives,
@@ -155,6 +156,12 @@ def generate_completions(
     generation = {
         "max_new_tokens": max_new_tokens,
         "do_sample": temperature > 0,
+        # Neutralize checkpoint defaults: rollout must match raw policy logits.
+        "top_k": 0,
+        "top_p": 1.0,
+        "typical_p": 1.0,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
         "num_return_sequences": num_generations,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
@@ -379,6 +386,9 @@ def train(args: argparse.Namespace) -> None:
             f"{len(samples_for_split)} {args.split} QA pairs {split_note}"
         )
     samples = shard_rows(samples_for_split, accelerator.process_index, accelerator.num_processes)
+    progress_log = getattr(args, "progress_log", None) or str(Path(args.output_dir) / "training_progress.jsonl")
+    append_progress(progress_log, "start", component="answer", epochs=args.epochs,
+                    samples=len(samples_for_split), split=args.split, data_path=args.data_path)
     validation_samples = (
         read_rows(args.validation_data_path) if args.validation_data_path else []
     )
@@ -460,8 +470,16 @@ def train(args: argparse.Namespace) -> None:
                 rollout_s=round(rollout_seconds, 1),
                 update_s=round(update_seconds, 1),
             )
+            if accelerator.is_main_process:
+                append_progress(progress_log, "sample_done", component="answer", epoch=epoch + 1,
+                                completed=progress.n, total=len(samples),
+                                reward=float(rewards.mean().item()), did_step=did_step,
+                                loss=None if loss != loss else loss,
+                                rollout_s=round(rollout_seconds, 3), update_s=round(update_seconds, 3))
 
         if accelerator.is_main_process:
+            append_progress(progress_log, "epoch_done", component="answer", epoch=epoch + 1,
+                            validation_f1=best_f1, validation_em=best_em)
             output_dir = Path(args.output_dir) / f"epoch_{epoch + 1}"
             output_dir.mkdir(parents=True, exist_ok=True)
             actor.save_pretrained(output_dir)
@@ -549,6 +567,7 @@ def main() -> None:
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--variance-epsilon", type=float, default=1e-12)
     parser.add_argument("--score-micro-batch", type=int, default=2)
+    parser.add_argument("--progress-log", help="Append-only JSONL progress log; defaults to output-dir/training_progress.jsonl")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--split", choices=["all", "train", "validation", "test"], default="train")

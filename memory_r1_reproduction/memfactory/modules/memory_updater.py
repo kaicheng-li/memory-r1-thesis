@@ -115,6 +115,11 @@ class NaiveUpdater(BaseModule):
                 attention_mask=attention_mask,
                 max_new_tokens=self.max_generate_length,
                 temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                typical_p=1.0,
+                repetition_penalty=1.0,
+                no_repeat_ngram_size=0,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
                 do_sample=True

@@ -4,8 +4,9 @@ Produces QA-conditioned single-step states per the paper's Section 3.1 /
 Eq. (1) / Algorithm 1 reading:
 
     state  = (old_bank, current_facts)
-    old_bank      = provenance-preserving union of all teacher-extracted facts
-                    from dialogue turns STRICTLY BEFORE the target turn
+    old_bank      = provenance-preserving union of teacher-extracted facts
+                    STRICTLY BEFORE the target turn (default: full prefix;
+                    optional --history-window 24: preceding 24 turns only)
                     (no current-turn facts, no future facts -> no leakage)
     current_facts = teacher facts of the target turn
     target turn   = chronologically LAST evidence turn of the QA
@@ -143,11 +144,15 @@ def rebuild_split(raw_samples: list[dict[str, Any]],
                   facts_jsonl: Path,
                   split: str,
                   build_states: bool = True,
+                  history_window: int | None = None,
                   ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    if history_window is not None and history_window < 1:
+        raise ValueError("history_window must be positive or None (fullprefix)")
     instances = []
     timelines = []
     stats: dict[str, Any] = {
         "split": split,
+        "history_window": history_window,
         "dialogues": [],
         "qa_cat1_4": 0,
         "bindable": 0,
@@ -209,6 +214,7 @@ def rebuild_split(raw_samples: list[dict[str, Any]],
                      [eid for eid in evidence if eid not in dia_to_index]))
 
             target_turn = max(dia_to_index[eid] for eid in mapped)
+            history_start = max(0, target_turn - history_window) if history_window is not None else 0
             targets.add(target_turn)
             current_facts = facts_by_turn.get(target_turn, [])
             if not current_facts:
@@ -229,8 +235,10 @@ def rebuild_split(raw_samples: list[dict[str, Any]],
                 "evidence_mapped": mapped,
                 "target_has_facts": bool(current_facts),
                 "current_facts": current_facts,
+                "history_window": history_window,
+                "history_start_turn": history_start,
                 "old_bank": [entry for entry in full_bank
-                             if entry["source_turn"] < target_turn],
+                             if history_start <= entry["source_turn"] < target_turn],
             })
             stats["bindable"] += 1
 
@@ -259,7 +267,9 @@ def main() -> None:
     parser.add_argument("--raw", default="data/locomo10.json")
     parser.add_argument("--facts-jsonl", default="data/manager_training_data_vllm.jsonl",
                         help="Existing Algorithm-1 JSONL used as the cached teacher-facts store")
-    parser.add_argument("--output-dir", default="data/stage0")
+    parser.add_argument("--output-dir", help="Default: data/stage0 (fullprefix) or data/stage0_window24 (24)")
+    parser.add_argument("--history-window", choices=["fullprefix", "24"], default="fullprefix",
+                        help="Single-step old_bank history; full dialogue timelines are unchanged")
     parser.add_argument("--splits", nargs="+", default=["train", "validation"],
                         choices=list(SPLIT_DIALOGUE_IDS))
     parser.add_argument(
@@ -271,7 +281,8 @@ def main() -> None:
     raw_samples = json.loads(Path(args.raw).read_text(encoding="utf-8"))
     if not isinstance(raw_samples, list):
         raw_samples = [raw_samples]
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir or ("data/stage0" if args.history_window == "fullprefix"
+                                         else "data/stage0_window24"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_stats = {}
@@ -279,6 +290,7 @@ def main() -> None:
         instances, timelines, stats = rebuild_split(
             raw_samples, Path(args.facts_jsonl), split,
             build_states=not args.timeline_only,
+            history_window=None if args.history_window == "fullprefix" else 24,
         )
         out_path = output_dir / f"manager_states_{split}.jsonl"
         if not args.timeline_only:

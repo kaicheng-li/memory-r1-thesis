@@ -72,6 +72,8 @@ class AnswerAgent:
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
+                repetition_penalty=1.0,
+                no_repeat_ngram_size=0,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )

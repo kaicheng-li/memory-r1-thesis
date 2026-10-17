@@ -43,6 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evaluation.matching import match_locomo_v2
+from memfactory.progress import append_progress
 
 
 def oracle_bank(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -129,6 +130,9 @@ def main() -> None:
         help="Minimum layered-match 0->1 transitions to pass (default: 15)",
     )
     args = parser.parse_args()
+    progress_log = args.output + ".progress.jsonl"
+    append_progress(progress_log, "start", states=args.states, output=args.output,
+                    rescore=bool(args.rescore_input), device=args.device)
 
     source_summary: dict[str, Any] = {}
     if args.rescore_input:
@@ -139,6 +143,7 @@ def main() -> None:
             parser.error("--rescore-input must contain a non-empty records list")
         records = [score_predictions(record) for record in source_records]
         print(f"rescored {len(records)} saved QA pairs from {args.rescore_input}", flush=True)
+        append_progress(progress_log, "rescored", completed=len(records), total=len(records))
     else:
         if not args.model_path:
             parser.error("--model-path is required unless --rescore-input is used")
@@ -165,6 +170,14 @@ def main() -> None:
             })
             records.append(record)
             elapsed = time.time() - started
+            append_progress(
+                progress_log, "state_done", completed=index, total=len(states),
+                dialogue_id=record["dialogue_id"], question_id=record["question_id"],
+                noop_f1=record["noop_f1"], oracle_f1=record["oracle_f1"],
+                match_delta=record["oracle_match"] - record["noop_match"],
+                elapsed_s=round(elapsed, 3),
+                eta_s=round(elapsed / index * (len(states) - index), 3),
+            )
             print(f"[{index}/{len(states)}] qid={record['question_id']} "
                   f"noop_f1={record['noop_f1']:.3f} "
                   f"oracle_f1={record['oracle_f1']:.3f} "
@@ -214,6 +227,8 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({"summary": summary, "records": records},
                                  ensure_ascii=False, indent=2), encoding="utf-8")
+    append_progress(progress_log, "done", completed=n, total=n,
+                    gate_passed=summary["gate_passed"], f1_mean_delta=summary["f1_mean_delta"])
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"wrote {output}")
     print("GATE PASSED" if summary["gate_passed"] else

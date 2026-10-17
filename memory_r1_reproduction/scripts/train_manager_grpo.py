@@ -38,6 +38,7 @@ from evaluation.manager_validation import (
 )
 from evaluation.metrics import exact_match, f1_score
 from memfactory.chat import tokenize_chat_prompt
+from memfactory.progress import append_progress
 from memfactory.lora import (
     average_gradients,
     initialize_collectives,
@@ -98,6 +99,12 @@ class TextModel:
         generation: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "do_sample": temperature > 0,
+            # Neutralize checkpoint defaults: rollout must match raw policy logits.
+            "top_k": 0,
+            "top_p": 1.0,
+            "typical_p": 1.0,
+            "repetition_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "use_cache": True,
@@ -523,6 +530,10 @@ def train(args: argparse.Namespace) -> None:
         resume_epoch_optimizer_steps = int(state.get("epoch_optimizer_steps", 0))
 
     states = read_training_states(args.data_path)
+    progress_log = getattr(args, "progress_log", None) or str(Path(args.output_dir) / "training_progress.jsonl")
+    append_progress(progress_log, "start", component="manager", epochs=args.epochs,
+                    states=len(states), world_size=accelerator.num_processes,
+                    data_path=args.data_path)
     unique_targets = len({
         (row["dialogue_id"], int(row["target_turn"])) for row in states
     })
@@ -616,6 +627,12 @@ def train(args: argparse.Namespace) -> None:
                     totals["grad_max"], values[-1] / accelerator.num_processes
                 )
             global_reward = values[3] / max(values[4], 1.0)
+            if accelerator.is_main_process:
+                append_progress(progress_log, "group_done", component="manager", epoch=epoch,
+                                group=group_index + 1, total_groups=len(local_states),
+                                global_step=global_step, reward=global_reward,
+                                reward_std=update["reward_std"], did_step=update["did_step"],
+                                loss=None if math.isnan(update["loss"]) else update["loss"])
             progress.set_postfix(
                 reward=f"{global_reward:.4f}",
                 reward_std=f"{update['reward_std']:.4f}",
@@ -648,6 +665,10 @@ def train(args: argparse.Namespace) -> None:
                 )
 
         if accelerator.is_main_process:
+            append_progress(progress_log, "epoch_done", component="manager", epoch=epoch,
+                            optimizer_steps=epoch_optimizer_steps,
+                            reward=totals["reward_sum"] / max(totals["reward_count"], 1),
+                            signal_groups=int(totals["signal_groups"]), groups=int(totals["groups"]))
             print(
                 f"Manager epoch {epoch} summary: "
                 f"optimizer_steps={epoch_optimizer_steps}, global_step={global_step}, "
@@ -789,6 +810,7 @@ def main() -> None:
         "--save-every-groups", type=int, default=0,
         help="Write a resumable mid-epoch checkpoint every N local groups; 0 disables",
     )
+    parser.add_argument("--progress-log", help="Append-only JSONL progress log; defaults to output-dir/training_progress.jsonl")
     args = parser.parse_args()
     if args.epochs < 1 or args.epochs > 5:
         parser.error("--epochs must be between 1 and 5")
