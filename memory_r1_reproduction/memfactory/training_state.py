@@ -32,14 +32,16 @@ def preserve_rng():
 
 
 def resume_contract(manifest):
-    ignored = {"resume", "output_dir", "group_log", "epochs", "checkpoint_every"}
+    # Output sinks are observational and must not make a valid checkpoint
+    # incompatible when a resumed run uses a different directory or log path.
+    ignored = {"resume", "output_dir", "group_log", "progress_log", "epochs", "checkpoint_every"}
     return {"config": {k: v for k, v in manifest["config"].items()
                        if k not in ignored and not k.startswith("_")},
             **{k: manifest[k] for k in ("data_sha256", "validation_sha256", "answer_adapter_sha256",
                                         "manager_adapter_sha256", "retrieval", "reward_definition", "prompt_contract")}}
 
 
-def save_training_checkpoint(manager, optimizer, directory, epoch, next_tuple, best, contract):
+def save_training_checkpoint(manager, optimizer, directory, epoch, next_tuple, best, contract, scheduler=None, epoch_stats=None):
     directory = Path(directory)
     # Never overwrite a complete checkpoint with a partially written adapter.
     if directory.exists():
@@ -49,6 +51,8 @@ def save_training_checkpoint(manager, optimizer, directory, epoch, next_tuple, b
     manager.model.save_pretrained(temporary)
     manager.tokenizer.save_pretrained(temporary)
     torch.save({"optimizer": optimizer.state_dict(), "rng": capture_rng(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "epoch_stats": epoch_stats,
                 "epoch": epoch, "next_tuple": next_tuple, "best": best, "contract": contract},
                temporary / "training_state.pt")
     temporary.rename(directory)

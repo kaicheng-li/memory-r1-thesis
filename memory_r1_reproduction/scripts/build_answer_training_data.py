@@ -1,4 +1,4 @@
-"""Build Answer tuples by replaying the same windows as Manager training."""
+"""Build Answer tuples with the baseline full-dialogue replay protocol."""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ from memfactory.memory_runtime import (
     retrieve,
     retrieve_per_speaker,
 )
-from scripts.construct_memory_bank import Manager
+from memfactory.modules.memory_updater import build_manager_input
+from memfactory.oracle_reward import gold_text
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -59,24 +60,14 @@ def raw_questions(sample: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def replay_manager_window(
-    tuple_row: dict[str, Any], manager: Manager, manager_top_k: int
+    tuple_row: dict[str, Any], manager: Any, manager_top_k: int
 ) -> tuple[list[dict[str, Any]], int]:
-    """Replay one Algorithm-5 window from an empty bank using cached facts."""
+    """Replay the supplied complete dialogue from an empty bank using cached facts."""
     bank: list[dict[str, Any]] = []
     invalid_actions = 0
     for turn in tuple_row["dialogue_turns"]:
-        facts = [
-            {
-                "speaker": str(fact.get("speaker", turn.get("speaker", ""))),
-                "timestamp": str(fact.get("timestamp", turn.get("timestamp", ""))),
-                "key": str(fact.get("key", "")),
-                "memory_type": str(fact.get("memory_type", "")),
-                "tags": fact.get("tags", []),
-                "text": str(fact.get("text", "")).strip(),
-            }
-            for fact in turn["facts"]
-            if isinstance(fact, dict) and str(fact.get("text", "")).strip()
-        ]
+        facts = [dict(fact) for fact in turn["facts"]
+                 if isinstance(fact, dict) and str(fact.get("text", "")).strip()]
         if not facts:
             continue
         query = " ".join(fact["text"] for fact in facts)
@@ -96,112 +87,72 @@ def replay_manager_window(
     return bank, invalid_actions
 
 
-def build_rows(
-    manager_tuples: list[dict[str, Any]],
-    manager: Manager,
-    manager_top_k: int,
-    per_speaker_top_k: int,
-    split: str,
-    manager_model: str,
-) -> list[dict[str, Any]]:
-    """Produce one Answer tuple per eligible QA at its evidence target turn."""
-    allowed_ids = set(SPLIT_DIALOGUE_IDS[split])
+def build_rows(timelines, manager, manager_top_k, per_speaker_top_k, split, manager_model):
+    """Replay each COMPLETE dialogue once; every QA reads its final bank.
+
+    This is the baseline Answer-data protocol, independent of Manager training
+    horizon. Validation uses a separate dialogue and the same selected Manager.
+    """
     rows = []
-    for tuple_row in manager_tuples:
-        metadata = tuple_row.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        dialogue_id = str(tuple_row["dialogue_id"])
-        row_split = tuple_row.get("split", metadata.get("split"))
-        if dialogue_id not in allowed_ids or row_split != split:
-            raise ValueError(f"Unexpected dialogue or split in Manager tuples: {dialogue_id}:{row_split}")
-        questions = tuple_row["linked_questions"]
-        if not questions:
-            continue
-        bank, invalid_actions = replay_manager_window(tuple_row, manager, manager_top_k)
-        participants = tuple_row["participants"]
-        for question in questions:
-            memories = retrieve_per_speaker(
-                question["question"], bank, participants, per_speaker_top_k
-            )
-            rows.append({
-                "dialogue_id": dialogue_id,
-                "question_id": str(question["question_id"]),
-                "question": str(question["question"]),
-                "retrieved_memories": memories,
-                "participants": participants,
-                "answer": str(question["answer"]),
-                "metadata": {
-                    "split": split,
-                    "manager_model": manager_model,
-                    "manager_top_k": manager_top_k,
-                    "per_speaker_top_k": per_speaker_top_k,
-                    "target_turn": tuple_row["turn_index"],
-                    "window_turns": len(tuple_row["dialogue_turns"]),
-                    "invalid_actions": invalid_actions,
-                    "memory_size": len(bank),
-                    "source": "manager_tuple_window_replay_v1",
-                },
-            })
+    for timeline in timelines:
+        if timeline.get("split") != split:
+            raise ValueError("Timeline split does not match requested Answer split")
+        if "turns" not in timeline or "questions" not in timeline:
+            raise ValueError("Answer data requires full dialogue timelines, not Manager windows")
+        if timeline["dialogue_id"] not in SPLIT_DIALOGUE_IDS[split]:
+            raise ValueError("Dialogue outside the fixed requested split")
+        replay = dict(timeline, dialogue_turns=timeline["turns"])
+        bank, invalid = replay_manager_window(replay, manager, manager_top_k)
+        for question in timeline["questions"]:
+            rows.append({"dialogue_id": timeline["dialogue_id"], "split": split,
+                "participants": timeline["participants"], "question_id": str(question["question_id"]),
+                "question": question["question"], "answer": gold_text(question["answer"]),
+                "category": question.get("category"),
+                "retrieved_memories": retrieve_per_speaker(question["question"], bank,
+                    timeline["participants"], per_speaker_top_k),
+                "metadata": {"source": "full_dialogue_cached_facts_greedy",
+                    "manager_model": manager_model, "turns": len(timeline["turns"]),
+                    "memory_size": len(bank), "invalid_actions": invalid}})
     return rows
 
 
-def build(
-    manager_tuples_path: str,
-    output_path: str,
-    manager_model: str,
-    manager_adapter: str | None,
-    manager_device: str,
-    manager_top_k: int,
-    per_speaker_top_k: int,
-    max_new_tokens: int,
-    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
-    split: str = "train",
-) -> None:
-    manager_tuples = read_rows(manager_tuples_path)
-    manager = Manager(manager_model, manager_device, max_new_tokens, manager_adapter, max_prompt_tokens)
-    rows = build_rows(
-        manager_tuples, manager, manager_top_k, per_speaker_top_k, split, manager_model
-    )
-    if not rows:
-        raise ValueError(f"No linked QA in {manager_tuples_path} for split {split}.")
-    source_hash = file_sha256(manager_tuples_path)
-    for row in rows:
-        row["metadata"]["manager_tuples_sha256"] = source_hash
-        row["metadata"]["manager_adapter"] = manager_adapter
-    write_jsonl(output_path, rows)
-    per_window = {
-        (row["dialogue_id"], row["metadata"]["target_turn"]): row["metadata"]["invalid_actions"]
-        for row in rows
-    }
-    invalid = sum(per_window.values())
-    print(f"wrote {len(rows)} Answer tuples to {output_path}; invalid replay actions={invalid}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build Answer tuples from Manager training windows.")
-    parser.add_argument("--manager-tuples", required=True, help="Algorithm-1 tuples with cached turn facts.")
-    parser.add_argument("--split", required=True, choices=list(SPLIT_DIALOGUE_IDS))
+def main():
+    import argparse
+    from scripts.train_manager_grpo import TextModel
+    from memfactory.progress import append_progress
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--timeline", required=True)
+    parser.add_argument("--split", required=True, choices=["train", "validation"])
     parser.add_argument("--output", required=True)
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--manager-adapter")
-    parser.add_argument("--manager-device", default="auto")
+    parser.add_argument("--manager-device", default="cuda")
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--per-speaker-top-k", type=int, default=30)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
+    parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     args = parser.parse_args()
-    build(
-        args.manager_tuples,
-        args.output,
-        args.manager_model,
-        args.manager_adapter,
-        args.manager_device,
-        args.manager_top_k,
-        args.per_speaker_top_k,
-        args.max_new_tokens,
-        args.max_prompt_tokens,
-        args.split,
-    )
+    model = TextModel(args.manager_model, args.manager_device, False,
+                      args.manager_adapter, args.max_prompt_tokens)
+    progress_log = str(Path(args.output).with_suffix(".progress.jsonl"))
+    class FrozenManager:
+        turn = 0
+        def generate(self, bank, facts, top_k):
+            self.turn += 1
+            append_progress(progress_log, "turn_start", turn=self.turn, memory_size=len(bank))
+            prompt = build_manager_input(retrieve(" ".join(f["text"] for f in facts), bank, top_k), facts)
+            raw = model.generate(prompt, args.max_new_tokens, 0.0)[0]
+            append_progress(progress_log, "turn_done", turn=self.turn)
+            return raw
+    timelines = read_rows(args.timeline)
+    rows = build_rows(timelines, FrozenManager(), args.manager_top_k,
+                      args.per_speaker_top_k, args.split, args.manager_model)
+    if not rows:
+        raise ValueError("No Answer QA generated")
+    for row in rows:
+        row["metadata"].update(timeline_sha256=file_sha256(args.timeline), manager_adapter=args.manager_adapter)
+    write_jsonl(args.output, rows)
+    print(f"Wrote {len(rows)} full-dialogue Answer tuples: {args.output}", flush=True)
 
 
 if __name__ == "__main__":

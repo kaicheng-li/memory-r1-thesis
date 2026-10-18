@@ -80,19 +80,27 @@ New Memory:
 }"""
 
 def build_manager_input(old_memory: List[Dict[str, Any]], retrieved_facts: List[Any]) -> str:
-    """Attach runtime memory and facts to the canonical Manager prompt."""
-    public_memory = [
-        {key: item[key] for key in ("id", "text", "speaker", "timestamp") if key in item}
-        for item in old_memory
-    ]
+    """Build the exact single-step action contract consumed by the parser."""
+    public_memory = [{key: value for key, value in item.items() if key != "source_turn_ids"}
+                     for item in old_memory]
     return (
-        f"{UPDATE_MEMORY_PROMPT}\n\n"
+        "You are a memory manager. Compare the new facts with the visible old "
+        "memory and return only operations that actually change the bank.\n"
+        "Allowed operations:\n"
+        "- ADD: requires non-empty text; the environment assigns its ID.\n"
+        "- UPDATE: requires an ID shown in Old Memory and replacement text.\n"
+        "- DELETE: requires an ID shown in Old Memory.\n"
+        "Return at most 5 operations. Do not return NONE, old_memory, markdown, "
+        "or explanations. If nothing changes, return {\"memory\":[]}.\n"
+        "Exact schema: {\"memory\":[{\"event\":\"ADD|UPDATE|DELETE\","
+        "\"id\":\"visible id for UPDATE/DELETE\",\"text\":\"text for ADD/UPDATE\"}]}\n\n"
         "Old Memory:\n"
         f"{json.dumps(public_memory, ensure_ascii=False, indent=2)}\n\n"
         "Retrieved facts:\n"
         f"{json.dumps(retrieved_facts, ensure_ascii=False, indent=2)}\n\n"
-        "Return only the JSON object with the key \"memory\"."
+        "JSON:"
     )
+
 
 @MODULE_REGISTRY.register("naive_updater")
 class NaiveUpdater(BaseModule):

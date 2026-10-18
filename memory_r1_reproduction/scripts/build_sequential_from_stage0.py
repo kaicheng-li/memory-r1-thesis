@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--timelines", required=True)
     parser.add_argument("--states", required=True)
     parser.add_argument("--split", required=True, choices=["train", "validation"])
-    parser.add_argument("--history-window", type=int, default=24)
+    parser.add_argument("--history-window", type=int, default=-1)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     timelines = json.loads(Path(args.timelines).read_text(encoding="utf-8"))

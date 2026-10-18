@@ -68,8 +68,8 @@ def prompt_budget(model, output_tokens):
 
 
 def safe_answer(model, question, memories, participants, max_new_tokens,
-                overflow="compress", compression_tokens=256, max_levels=5):
-    """Read every supplied fact, with no silent input truncation.
+                overflow="truncate", compression_tokens=256, max_levels=5):
+    """Baseline left truncation by default, with explicit token accounting.
 
     Over-budget contexts use hierarchical question-conditioned extraction with
     the SAME frozen model. No gold answers or evidence labels enter prompts.
@@ -78,12 +78,29 @@ def safe_answer(model, question, memories, participants, max_new_tokens,
     """
     if not participants or any(m.get("speaker") not in participants for m in memories):
         raise ContextBudgetError("Missing participants or memory speaker outside participants")
-    if overflow not in {"compress", "error"}:
-        raise ValueError("overflow must be compress or error")
+    if overflow not in {"truncate", "compress", "error"}:
+        raise ValueError("overflow must be truncate, compress or error")
     calls = []
     original_prompt = build_answer_input_from_memories(question, memories, participants)
     original_tokens = chat_token_count(model, original_prompt)
     answer_budget = prompt_budget(model, max_new_tokens)
+    if overflow == "truncate":
+        # Match baseline's tokenized prompt exactly. A smaller architectural
+        # context than the configured prompt+output budget is a configuration
+        # error, not a reason to silently introduce a different reader.
+        if answer_budget < min(original_tokens, model.max_prompt_tokens):
+            raise ContextBudgetError("Configured prompt/output exceeds model context capacity")
+        raw, ids = model.generate(original_prompt, max_new_tokens, temperature=0.0)
+        eos = getattr(model.tokenizer, "eos_token_id", None)
+        return {"prediction": extract_answer(raw), "raw_output": raw,
+                "status": "truncated" if original_tokens > answer_budget else "direct",
+                "compression_levels": 0, "source_memory_count": len(memories),
+                "source_prompt_tokens": original_tokens,
+                "input_truncated": original_tokens > answer_budget,
+                "output_limit_reached": len(ids) >= max_new_tokens and (not len(ids) or int(ids[-1]) != eos),
+                "calls": [{"prompt_tokens": min(original_tokens, answer_budget),
+                           "original_prompt_tokens": original_tokens,
+                           "output_tokens": len(ids), "budget": answer_budget}]}
 
     def generate(prompt, output_tokens):
         count = chat_token_count(model, prompt)

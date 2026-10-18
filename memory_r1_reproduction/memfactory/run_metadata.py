@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from memfactory.retrieval import retrieval_config
 
-PROMPT_CONTRACT = "speaker_grouped_public_memory_v2"
+PROMPT_CONTRACT = "baseline_87f13c5_prompts_per_question_grpo_v3"
 
 
 def file_sha256(path: str | Path) -> str:
@@ -60,8 +60,8 @@ def write_run_metadata(args, write=True) -> dict:
         "packages": packages,
         "answer_adapter_sha256": adapter_files,
         "validation_sha256": (
-            file_sha256(args.validation_timelines)
-            if getattr(args, "validation_timelines", None) else None
+            file_sha256(getattr(args, "validation_timelines", None) or args.validation_data_path)
+            if (getattr(args, "validation_timelines", None) or getattr(args, "validation_data_path", None)) else None
         ),
     }
     if not write:

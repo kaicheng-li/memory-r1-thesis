@@ -52,7 +52,19 @@ class ManagerGenerationTests(unittest.TestCase):
         results = []
 
         def capture(**kwargs):
-            result = generate(**kwargs, return_dict_in_generate=True, output_scores=True)
+            # Inspect the effective config AFTER Transformers fills defaults,
+            # not just the config we passed. None can resurrect checkpoint values.
+            effective, _ = reader.model._prepare_generation_config(kwargs["generation_config"])
+            effective.validate(strict=True)
+            self.assertEqual(effective.temperature, 1.0)
+            self.assertEqual(effective.top_p, 1.0)
+            self.assertEqual(effective.typical_p, 1.0)
+            self.assertEqual(effective.top_k, 0 if effective.do_sample else 50)
+            self.assertEqual(effective.repetition_penalty, 1.0)
+            self.assertEqual(effective.no_repeat_ngram_size, 0)
+            kwargs["generation_config"].return_dict_in_generate = True
+            kwargs["generation_config"].output_scores = True
+            result = generate(**kwargs)
             results.append(result)
             return result.sequences
 

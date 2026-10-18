@@ -212,3 +212,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# Baseline validation API; both paths use the same retrieval backend.
+top_k = retrieve
+from memfactory.memory_runtime import retrieve_per_speaker as top_k_per_speaker

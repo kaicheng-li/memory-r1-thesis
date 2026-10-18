@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
+
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,6 +21,7 @@ from memfactory.oracle_reward import (evaluate_controls, safe_answer, teacher_fa
                                       ContextBudgetError, gold_text, append_jsonl)
 from memfactory.run_metadata import write_run_metadata
 from memfactory.training_state import preserve_rng
+from memfactory.progress import append_progress
 
 
 def precheck_item(item, manager, answer, args, reward_fn):
@@ -83,12 +87,13 @@ def main():
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k", type=int, default=30)
-    parser.add_argument("--context-overflow", choices=["compress", "error"], default="compress")
+    parser.add_argument("--context-overflow", choices=["truncate", "compress", "error"], default="truncate")
     parser.add_argument("--compression-tokens", type=int, default=256)
     parser.add_argument("--control-threshold", type=float)
     parser.add_argument("--include-gold-support", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-raw", action="store_true")
     parser.add_argument("--limit-tuples", type=int, help="Smoke test only; omit for calibration")
+    parser.add_argument("--progress-log", help="Flushed JSONL progress log; defaults to output-dir/progress.jsonl")
     args = parser.parse_args()
     args.control_gate = "off" if args.control_threshold is None else "threshold"
     if args.control_threshold is not None and not 0 <= args.control_threshold <= 1:
@@ -101,25 +106,47 @@ def main():
     if args.limit_tuples:
         rows = rows[:args.limit_tuples]
     output = Path(args.output_dir)
+    if args.progress_log is None:
+        args.progress_log = str(output / "progress.jsonl")
     if (output / "run_manifest.json").exists():
         raise ValueError("Use a new precheck output directory")
     write_run_metadata(args)
+    started = time.monotonic()
+    append_progress(args.progress_log, "start", total_tuples=len(rows), data_path=args.data_path,
+                    reward=args.reward, control_threshold=args.control_threshold)
     manager = TextModel(args.manager_model, args.device, False, args.manager_adapter, args.max_prompt_tokens)
     answer = TextModel(args.answer_model, args.device, False, args.answer_adapter, args.max_prompt_tokens)
     reward_fn = f1_score if args.reward == "f1" else exact_match
     all_records = []
-    for index, row in enumerate(rows):
+    progress = tqdm(rows, total=len(rows), desc="precheck", unit="tuple")
+    for index, row in enumerate(progress):
+        tuple_started = time.monotonic()
+        tuple_records = 0
         for record in precheck_item(row, manager, answer, args, reward_fn):
             record["tuple_index"] = index
             append_jsonl(output / "paired.jsonl", record)
             all_records.append(record)
+            tuple_records += 1
+        elapsed = time.monotonic() - started
+        completed = index + 1
+        eta = elapsed / completed * (len(rows) - completed) if completed else None
+        progress.set_postfix(qa=tuple_records, eta=f"{eta:.0f}s" if eta is not None else "?")
+        append_progress(args.progress_log, "tuple_done", tuple_index=index,
+                        dialogue_id=row["dialogue_id"], qa=tuple_records,
+                        tuple_seconds=round(time.monotonic() - tuple_started, 3),
+                        completed=completed, total_tuples=len(rows),
+                        elapsed_seconds=round(elapsed, 3),
+                        eta_seconds=round(eta, 3) if eta is not None else None)
     scores = [r["conditions"]["teacher_all_facts"]["score"] for r in all_records]
     valid = [score for score in scores if score is not None]
     summary = {"qa": len(scores), "valid_control": len(valid), "context_errors": len(scores)-len(valid),
                "teacher_score_distribution": sorted(valid),
                "threshold_sweep": {str(t): sum(s >= t for s in valid) for t in [0, .25, .5, .75, 1]},
-               "note": "Choose threshold on TRAIN only; keep identical across ablations. Full test is unfiltered."}
+               "note": "Diagnostic threshold sweep only. Main A/B/C uses gate off; no QA is excluded by these scores."}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    append_progress(args.progress_log, "done", qa=len(scores), valid_control=len(valid),
+                    context_errors=len(scores) - len(valid), total_tuples=len(rows),
+                    elapsed_seconds=round(time.monotonic() - started, 3))
     print(json.dumps(summary, ensure_ascii=False))
 
 

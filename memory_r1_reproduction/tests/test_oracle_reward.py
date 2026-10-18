@@ -90,7 +90,7 @@ class ContextTests(unittest.TestCase):
     def test_compression_reads_all_source_characters_including_long_fact(self):
         reader = Reader()
         original = "".join(f"FACT-{i:04d};" for i in range(1200))
-        result = safe_answer(reader, "Where?", [{"speaker":"Ada", "text":original}], ["Ada"], 50)
+        result = safe_answer(reader, "Where?", [{"speaker":"Ada", "text":original}], ["Ada"], 50, "compress")
         extracts = [p for p in reader.prompts if p.startswith("Extract concise")]
         # First pass fragments cover the entire source, in order, without dropped tails.
         fragments = [row["text"] for p in extracts for row in json.loads(p.split("Records: ",1)[1])]
@@ -102,7 +102,7 @@ class ContextTests(unittest.TestCase):
         reader = Reader(10000)
         with patch.object(reader, "generate", return_value=("unfinished", torch.tensor([1]*5))):
             with self.assertRaisesRegex(ContextBudgetError, "output limit"):
-                safe_answer(reader, "Where?", [], ["Ada"], 5)
+                safe_answer(reader, "Where?", [], ["Ada"], 5, "error")
 
     def test_gate_and_context_errors_separate(self):
         item = {"participants":["Ada"], "dialogue_turns":[{"speaker":"Ada", "dia_id":"D1:1",
@@ -130,13 +130,15 @@ class SavedLinear(torch.nn.Linear):
 class TinyPolicy:
     def __init__(self, path, device, trainable, adapter_path=None, max_prompt_tokens=4096):
         self.device = "cpu"
+        self.calls = 0
         self.model = SavedLinear(1,1,bias=False)
         if adapter_path:
             self.model.load_state_dict(torch.load(Path(adapter_path)/"adapter.pt", weights_only=True))
         self.tokenizer = SimpleNamespace(save_pretrained=lambda directory: None)
     def generate(self, *_args):
         token = 1 + int(torch.randint(0,3,()).item()) + int(random.random()>.5) + int(np.random.random()>.5)
-        return '{"memory":[{"event":"ADD","text":"memory"}]}', torch.tensor([token])
+        self.calls += 1
+        return json.dumps({"memory": [{"event": "ADD", "text": f"memory{self.calls % 2}"}]}), torch.tensor([token])
     def log_probability(self, _prompt, tokens):
         return self.model(tokens.float().reshape(-1,1)).flatten()
 
@@ -150,7 +152,7 @@ def sample_row(index=0):
 
 def fake_answer(_model, _q, memories, *_args):
     teacher = memories and str(memories[0].get("id", "")).startswith("teacher:")
-    return {"prediction":"Paris" if not memories or teacher else "wrong", "status":"direct"}
+    return {"prediction":"Paris" if not memories or teacher or memories[-1]["text"] == "memory1" else "wrong", "status":"direct"}
 
 
 class IntegrationTests(unittest.TestCase):
@@ -164,8 +166,8 @@ class IntegrationTests(unittest.TestCase):
             source.write_text("\n".join(json.dumps(sample_row(i)) for i in range(2)),encoding="utf-8")
             def args(output, resume=None):
                 values = ["--data-path",str(source),"--manager-model","fake","--answer-model","fake",
-                          "--output-dir",str(root/output),"--control-threshold","0.5", "--beta","0",
-                          "--evidence-weight","0", "--num-generations","2", "--checkpoint-every","1"]
+                          "--output-dir",str(root/output),"--epochs","1", "--beta","0",
+                          "--evidence-weight","0", "--num-generations","4", "--checkpoint-every","1"]
                 if resume:
                     values += ["--resume",str(resume)]
                 return build_parser().parse_args(values)
@@ -190,8 +192,10 @@ class IntegrationTests(unittest.TestCase):
             np.testing.assert_equal(direct["rng"]["numpy"],resumed["rng"]["numpy"])
             logs = [json.loads(line) for line in (root/"resumed"/"groups.jsonl").read_text().splitlines()]
             self.assertEqual([r["tuple_index"] for r in logs if "tuple_index" in r], [1])
-            self.assertEqual(logs[-1]["update"]["eligible_actions"], 2)
-            self.assertTrue(all(a < 0 for a in logs[-1]["update"]["groups"][0]["advantages"]))
+            self.assertEqual(logs[-1]["update"]["eligible_actions"], 4)
+            self.assertAlmostEqual(sum(logs[-1]["update"]["groups"][0]["advantages"]), 0.0)
+            self.assertEqual(direct["scheduler"], resumed["scheduler"])
+            self.assertEqual(direct["epoch_stats"], resumed["epoch_stats"])
             with self.assertRaisesRegex(ValueError, "configuration differs"):
                 read_training_state(checkpoint, {})
 
@@ -206,11 +210,11 @@ class IntegrationTests(unittest.TestCase):
         np.testing.assert_equal(before["numpy"],after["numpy"])
         torch.testing.assert_close(before["torch"],after["torch"])
 
-    def test_gate_masks_qa_and_potential_and_reuses_controls(self):
+    def test_diagnostics_do_not_mask_qa_or_potential(self):
         row = sample_row()
         row["linked_questions"].append({"question_id":"2","question":"excluded", "answer":"bad","evidence":["D1:9"]})
         args = build_parser().parse_args(["--data-path","unused","--manager-model","fake","--answer-model","fake",
-                                         "--control-threshold",".5"])
+                                         "--control-diagnostics"])
         controls = [{"eligible":True,"noop":{"score":.2}}, {"eligible":False,"noop":{"score":.9}}]
         seen = []
         def phi(q,*_a):
@@ -223,9 +227,11 @@ class IntegrationTests(unittest.TestCase):
              patch("scripts.train_manager_grpo.apply_policy_update",return_value=float("nan")) as update:
             train_from_tuples(args,TinyPolicy("","cpu",True),None,TinyPolicy("","cpu",False),None,f1_score,[row])
         self.assertEqual(control.call_count,1)
-        self.assertEqual(seen,["1"]*4)
-        self.assertAlmostEqual(update.call_args.args[3][0]["noop_baseline"],.2)
-        self.assertTrue(all(abs(r[0]-1.2)<1e-6 for r in update.call_args.args[4]))
+        self.assertEqual(seen,["1", "2"]*4)
+        self.assertNotIn("noop_baseline", update.call_args.args[3][0])
+        self.assertEqual(len(args._question_rewards), 2)
+        self.assertTrue(all(abs(r[0]-1.2)<1e-6 for r in args._question_rewards[0]))
+        self.assertTrue(all(abs(r[0]-.2)<1e-6 for r in args._question_rewards[1]))
 
 
 class PipelineTests(unittest.TestCase):
@@ -283,10 +289,10 @@ class PipelineTests(unittest.TestCase):
     def test_speaker_attribution_survives_chunking(self):
         reader=Reader(4500)
         memories=[{"speaker":name,"text":"long fact "*1000} for name in ("Ada","Bob")]
-        safe_answer(reader,"Where?",memories,["Ada","Bob"],50)
+        safe_answer(reader,"Where?",memories,["Ada","Bob"],50,"compress")
         final=reader.prompts[-1]
-        self.assertIn('"speaker": "Bob"',final)
-        self.assertIn('"speaker": "Ada"',final)
+        self.assertIn('Memories for user Bob:',final)
+        self.assertIn('Memories for user Ada:',final)
         for prompt in reader.prompts[:-1]:
             rows=json.loads(prompt.split("Records: ",1)[1])
             self.assertEqual(len({r["speaker"] for r in rows}),1)

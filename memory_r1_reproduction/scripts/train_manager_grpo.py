@@ -1,16 +1,9 @@
-"""Algorithm 5: train the Memory Manager with a fixed Answer Agent.
+"""Controlled sequential Manager training for A/B/C experiments.
 
-Primary data path: Algorithm 1 tuples (build_manager_training_data.py output).
-Each tuple is (dialogue_turns, current_turn, linked_questions), plus an
-optional unused temporal_memory_bank field for data compatibility. Every
-turn carries its teacher-extracted facts (LLMExtract, Algorithm 5 line 7).
-Per tuple
-the manager starts from an empty bank (M <- {}) and replays every turn of the
-tuple's dialogue window — retrieve with the turn's facts -> manager op ->
-apply; the frozen Answer Agent then answers the linked questions with the
-resulting bank — the configured F1/EM reward on its answers is the training
-signal. The Answer tuple builder replays the same windows with a frozen
-initial Manager, without consuming the optional teacher temporal bank.
+B/C replay cached facts from an empty bank over each full causal prefix.
+They share per-question GRPO and invalid-action return masking; only evidence
+weight differs. The frozen base reader scores terminal QA. Answer training
+later uses full-dialogue replay, matching baseline-lora's downstream protocol.
 """
 
 from __future__ import annotations
@@ -21,6 +14,7 @@ import json
 import math
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +38,7 @@ from evaluation.metrics import normalize_text, exact_match as exact_match_reward
 from memfactory.oracle_reward import (safe_answer, extract_answer, gold_text, evaluate_controls, ContextBudgetError,
                                       estimate_advantages, append_jsonl)
 from memfactory.memory_runtime import apply_decisions, parse_manager_output, retrieve, retrieve_per_speaker
+from memfactory.progress import append_progress
 
 
 def read_rows(path: str) -> list[dict[str, Any]]:
@@ -67,8 +62,8 @@ def normalize_tuples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Algorithm 1 rows -> (dialogue_turns, temporal_memory_bank, current_turn, linked_questions)."""
     normalized = []
     for row in rows:
-        if row.get("initial_bank"):
-            raise ValueError("This trainer defines the noop baseline at an empty initial bank; nonempty initial_bank is unsupported")
+        if row.get("initial_bank") or row.get("initial_memory_bank") or row.get("temporal_memory_bank"):
+            raise ValueError("Formal fullprefix input starts empty; nonempty initial banks require a separately specified experiment")
         metadata = row.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
         normalized.append({
@@ -95,7 +90,7 @@ def evidence_ids(question: dict[str, Any]) -> set[str]:
 
 def memory_source_ids(memory: list[dict[str, Any]]) -> set[str]:
     """Collect provenance ids without treating updated text as new evidence."""
-    return {source for entry in memory for source in entry["source_turn_ids"]}
+    return {source for entry in memory for source in entry.get("source_turn_ids", [])}
 
 
 def potential_shaping_rewards(
@@ -140,17 +135,13 @@ def evidence_potential(
     This is training-only privileged information. The Answer Agent still sees
     only the retrieved memory, never the original dialogue or evidence labels.
     """
-    all_evidence = evidence_ids(question)
-    if not all_evidence:
+    # Turn-origin coverage proxy from the thesis outline. No semantic support
+    # claim, and no additional retrieval objective. New evidence can expand
+    # the denominator and lower coverage without deletion.
+    available = evidence_ids(question) & available_evidence
+    if not available:
         return 0.0
-
-    stored = memory_source_ids(memory)
-    memory_coverage = len(available_evidence & stored) / len(all_evidence)
-
-    retrieved = retrieve_per_speaker(question["question"], memory, participants, answer_top_k)
-    retrieved_sources = memory_source_ids(retrieved)
-    retrieval_coverage = len(available_evidence & retrieved_sources) / len(all_evidence)
-    return 0.5 * memory_coverage + 0.5 * retrieval_coverage
+    return len(available & memory_source_ids(memory)) / len(available)
 
 
 # ---------------------------------------------------------------------------
@@ -177,50 +168,16 @@ class TextModel:
         re-tokenized reconstruction of the decoded text.
         """
         inputs = tokenize_chat_prompt(self.tokenizer, prompt, self.max_prompt_tokens).to(self.device)
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            with torch.no_grad():
-                generation = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": temperature > 0,
-                    # Valid in BOTH greedy and sampling modes: neutralize the
-                    # checkpoint's factory repetition settings (e.g. Qwen ships
-                    # repetition_penalty=1.05) so sampling matches the raw
-                    # policy that log_probability scores, and greedy stays
-                    # pure argmax.  These fields never trigger the invalid-flag
-                    # warning, so they must always be passed explicitly.
-                    "repetition_penalty": 1.0,
-                    "no_repeat_ngram_size": 0,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "eos_token_id": self.tokenizer.eos_token_id,
-                }
-                if temperature > 0:
-                    generation.update({
-                        "temperature": temperature,
-                        "top_k": 0,
-                        "top_p": 1.0,
-                        "typical_p": 1.0,
-                    })
-                else:
-                    # Some Qwen checkpoints ship a generation_config.json with
-                    # sampling fields even though this call is greedy.  Recent
-                    # Transformers versions warn that temperature/top_k are
-                    # invalid in that mode.  Pass a clean per-call config so
-                    # the frozen reader and validation path are deterministic
-                    # and the warning cannot depend on the checkpoint file.
-                    configured = getattr(self.model, "generation_config", None)
-                    if configured is not None:
-                        configured = copy.deepcopy(configured)
-                        for field in ("temperature", "top_k", "top_p", "typical_p"):
-                            if hasattr(configured, field):
-                                setattr(configured, field, None)
-                        generation["generation_config"] = configured
-                output = self.model.generate(**inputs, **generation)
-        finally:
-            self.model.train(was_training)
+        from memfactory.generation import generate_policy
+        output = generate_policy(self.model, self.tokenizer, inputs, max_new_tokens, temperature)
         prompt_length = inputs["input_ids"].shape[1]
-        completion_ids = output[0][prompt_length:].clone()
+        completion_ids = output[0][prompt_length:]
+        eos = self.tokenizer.eos_token_id
+        if eos is not None:
+            positions = (completion_ids == eos).nonzero(as_tuple=False)
+            if len(positions):
+                completion_ids = completion_ids[:int(positions[0]) + 1]
+        completion_ids = completion_ids.clone()
         text = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         return text, completion_ids
 
@@ -238,16 +195,19 @@ class TextModel:
         was_training = self.model.training
         self.model.eval()
         try:
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            logits = outputs.logits[:, :-1, :]
-            labels = input_ids[:, 1:]
             start = max(prompt_ids.numel() - 1, 0)
-            completion_logits = logits[:, start : start + completion_ids.numel(), :]
-            completion_labels = labels[:, start : start + completion_ids.numel()]
+            base = self.model.get_base_model() if hasattr(self.model, "peft_config") else self.model
+            if hasattr(base, "model") and hasattr(base, "lm_head"):
+                hidden = base.model(input_ids=input_ids, attention_mask=attention_mask,
+                                    use_cache=False, return_dict=True).last_hidden_state
+                completion_logits = base.lm_head(hidden[:, start:start + completion_ids.numel(), :])
+            else:
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                completion_logits = outputs.logits[:, start:start + completion_ids.numel(), :]
+            completion_labels = input_ids[:, start + 1:start + 1 + completion_ids.numel()]
             return F.log_softmax(completion_logits, dim=-1).gather(2, completion_labels.unsqueeze(-1)).squeeze(-1)
         finally:
             self.model.train(was_training)
-
 
 
 def answer_with_model(
@@ -260,7 +220,7 @@ def answer_with_model(
 ) -> str:
     if hasattr(answer_model, "tokenizer"):
         return safe_answer(answer_model, question, memories, participants, max_new_tokens,
-                           getattr(answer_model, "context_overflow", "compress"),
+                           getattr(answer_model, "context_overflow", "truncate"),
                            getattr(answer_model, "compression_tokens", 256))["prediction"]
     # Minimal model doubles for runtime contract tests.
     prompt = build_answer_input_from_memories(question, memories, participants)
@@ -272,98 +232,49 @@ def answer_with_model(
 # RL update
 # ---------------------------------------------------------------------------
 
-def apply_policy_update(
-    manager: TextModel,
-    reference: TextModel | None,
-    optimizer: torch.optim.Optimizer,
-    trajectories: list[dict[str, Any]],
-    rewards: list[list[float]],
-    args: argparse.Namespace,
-) -> float:
-    returns = []
-    for trajectory_rewards in rewards:
-        trajectory_returns = [0.0] * len(trajectory_rewards)
-        running_return = 0.0
-        for index in reversed(range(len(trajectory_rewards))):
-            running_return = trajectory_rewards[index] + args.gamma * running_return
-            trajectory_returns[index] = running_return
-        returns.append(trajectory_returns)
-
-    eligible_actions = []
-    update_groups = []
-    action_positions = sorted({
-        action["turn_position"]
-        for trajectory in trajectories
-        for action in trajectory["actions"]
-    })
-    for position in action_positions:
-        active = []
-        for row_index, trajectory in enumerate(trajectories):
-            for action_index, action in enumerate(trajectory["actions"]):
-                if action["turn_position"] == position:
-                    active.append((trajectory, returns[row_index][action_index]))
-                    break
-        if not active:
-            continue
-        local_rewards = torch.tensor(
-            [reward for _, reward in active],
-            dtype=torch.float32,
-            device=manager.device,
-        )
-        advantages, skip = estimate_advantages(
-            local_rewards, getattr(args, "advantage_estimator", "grpo"),
-            trajectories[0].get("noop_baseline", 0.0),
-            getattr(args, "adv_scale", 1.0), getattr(args, "adv_clip", 5.0),
-            getattr(args, "variance_epsilon", 1e-6))
-        update_groups.append({"turn_position": position, "returns": local_rewards.tolist(),
-                              "advantages": advantages.tolist(), "skipped": skip})
-        if skip:
-            continue
-        for (trajectory, _), advantage in zip(active, advantages):
-            action = next(
-                action for action in trajectory["actions"]
-                if action["turn_position"] == position
-            )
-            if action["completion_ids"].numel() > 0:
-                eligible_actions.append((action, advantage))
-    args._last_update = {"groups": update_groups, "eligible_actions": len(eligible_actions)}
-    if not eligible_actions:
+def apply_policy_update(manager, reference, optimizer, trajectories, rewards, args):
+    from memfactory.sequential_credit import question_credit, clipped_surrogate
+    question_rewards = getattr(args, "_question_rewards", None)
+    if question_rewards is None:
+        question_rewards = [rewards]  # single-question compatibility API
+    contributions, groups = question_credit(
+        trajectories, question_rewards, args.gamma,
+        getattr(args, "variance_epsilon", 1e-12), manager.device)
+    args._last_update = {"groups": groups, "eligible_actions": len(contributions),
+                        "questions": len(question_rewards), "did_step": False}
+    if not contributions:
         return float("nan")
-
     optimizer.zero_grad()
     loss_sum = 0.0
-    for action, advantage in eligible_actions:
-        prompt = action["prompt"]
-        completion_ids = action["completion_ids"]
-        old_token_log_probs = action["old_token_log_probs"]
-        token_log_probs = manager.log_probability(prompt, completion_ids)  # [L']
-        if args.algorithm == "ppo":
-            ratio = torch.exp(token_log_probs.sum() - old_token_log_probs.sum())
-            clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
-            action_loss = -torch.minimum(ratio * advantage, clipped * advantage)
-        else:
-            # GRPO: per-token clipped importance ratio, averaged over the
-            # action tokens (same objective shape as the Answer Agent trainer).
-            ratio = torch.exp(token_log_probs - old_token_log_probs)
-            clipped = torch.clamp(ratio, 1 - args.clip_epsilon, 1 + args.clip_epsilon)
-            per_token = -torch.minimum(ratio * advantage, clipped * advantage)
-            action_loss = per_token.mean()
-        if reference is not None:
+    for (i, j), question_terms in contributions.items():
+        action = trajectories[i]["actions"][j]
+        log_probs = manager.log_probability(action["prompt"], action["completion_ids"])
+        kl = log_probs.new_zeros(())
+        if getattr(args, "beta", 0.0):
             with torch.no_grad():
-                reference_log_probs = reference.log_probability(prompt, completion_ids)
-            if reference_log_probs.numel() > 0:
-                log_ratio = reference_log_probs - token_log_probs
-                # R1-style KL penalty k3(u) = e^u - u - 1, u = log ref - log act.
-                action_loss = action_loss + args.beta * (
-                    log_ratio.exp() - 1 - log_ratio
-                ).mean()
-        # Backpropagate now, rather than retaining every long action graph
-        # until the end of a sequential rollout group.
-        (action_loss / len(eligible_actions)).backward()
-        loss_sum += float(action_loss.detach().item())
-    torch.nn.utils.clip_grad_norm_(trainable_parameters(manager.model), 1.0)
+                if reference is not None:
+                    ref = reference.log_probability(action["prompt"], action["completion_ids"])
+                else:
+                    # Same frozen base reference as baseline-lora, no third 7B.
+                    with manager.model.disable_adapter():
+                        ref = manager.log_probability(action["prompt"], action["completion_ids"])
+            delta = ref - log_probs
+            kl = args.beta * (delta.exp() - 1 - delta).mean()
+        # Compute each question's surrogate BEFORE averaging; opposite-signed
+        # advantages need not commute with PPO clipping. Same-sign terms do.
+        action_loss = sum(weight * (clipped_surrogate(
+            log_probs, action["old_token_log_probs"], advantage, args.clip_epsilon) + kl)
+            for _, advantage, weight in question_terms)
+        # Equal per-QA epoch weighting despite variable questions per tuple.
+        action_loss = action_loss * getattr(args, "_tuple_question_weight", 1.0)
+        action_loss.backward()
+        loss_sum += float(action_loss.detach())
+    torch.nn.utils.clip_grad_norm_(trainable_parameters(manager.model), getattr(args, "grad_clip_norm", 1.0))
     optimizer.step()
-    return loss_sum / len(eligible_actions)
+    if getattr(args, "_scheduler", None) is not None:
+        args._scheduler.step()
+    args._last_update["did_step"] = True
+    return loss_sum
 
 
 # ---------------------------------------------------------------------------
@@ -372,27 +283,49 @@ def apply_policy_update(
 
 def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples,
                       start_index=0, on_group_end=None) -> None:
-    """Algorithm 5 over Algorithm 1 tuples.
+    """Per-question GRPO over shared fullprefix trajectories.
 
     Per tuple: M <- {}; replay every turn of the tuple's dialogue window
     using the turn's teacher-extracted facts (LLMExtract) — retrieve with the
     facts -> manager op -> apply; then answer the linked questions with the
-    frozen Answer Agent over the resulting bank. One GRPO/PPO update per
+    frozen Answer Agent over the resulting bank. One GRPO update per
     tuple over its num_generations trajectories. Evidence-aware potential
     differences are added to final QA reward. Their effect on credit depends
     on the terminal boundary and the return/advantage estimator.
     """
+    if start_index == 0:
+        args._epoch_stats = {"questions": 0, "signal_questions": 0}
     progress = tqdm(enumerate(tuples), total=len(tuples), desc=f"memory-manager-{args.algorithm}")
     for tuple_index, item in progress:
         if tuple_index < start_index:
             continue
+        group_started = time.monotonic()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         questions = item["linked_questions"]
         log = {"epoch": getattr(args, "_epoch", 0), "tuple_index": tuple_index,
                "dialogue_id": item["dialogue_id"], "target_turn": item.get("turn_index"),
                "estimator": getattr(args, "advantage_estimator", "grpo"),
                "shaping_mode": getattr(args, "shaping_mode", "dense")}
         def finish():
+            log["elapsed_seconds"] = round(time.monotonic() - group_started, 3)
+            log["peak_cuda_allocated_bytes"] = (torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None)
+            args._epoch_stats["questions"] += len(questions)
+            args._epoch_stats["signal_questions"] += len({
+                g["question_index"] for g in log.get("update", {}).get("groups", []) if not g["skipped"]})
             append_jsonl(getattr(args, "group_log", None), log)
+            append_progress(
+                getattr(args, "progress_log", None),
+                "group_done",
+                epoch=log.get("epoch"), tuple_index=tuple_index,
+                dialogue_id=item.get("dialogue_id"), target_turn=item.get("turn_index"),
+                loss=log.get("loss"), skip_reason=log.get("skip_reason"),
+                invalid_actions=sum(t.get("invalid_actions", 0)
+                                     for t in log.get("trajectories", [])),
+                eligible_questions=log.get("eligible_questions"),
+                elapsed_seconds=log["elapsed_seconds"], timings=log.get("timings"),
+                peak_cuda_allocated_bytes=log["peak_cuda_allocated_bytes"],
+            )
             if on_group_end:
                 on_group_end(tuple_index + 1)
         if not questions:
@@ -400,50 +333,35 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
             finish()
             continue
         turns = item["dialogue_turns"]
-        controls = []
-        needs_controls = (getattr(args, "advantage_estimator", "grpo") == "noop"
-                          or getattr(args, "control_gate", "off") != "off"
-                          or getattr(args, "control_diagnostics", False))
-        if needs_controls:
-            # Greedy diagnostics must not perturb the Manager sampling RNG.
+        if getattr(args, "control_diagnostics", False):
             from memfactory.training_state import preserve_rng
             with preserve_rng():
-                controls = evaluate_controls(answer, item, args, reward_fn)
-            log["controls"] = controls
-            questions = [q for q, control in zip(questions, controls) if control["eligible"]]
-            if not questions:
-                log["skip_reason"] = "no_eligible_questions"
-                finish()
-                continue
-        baseline = (sum(c["noop"]["score"] for c in controls if c["eligible"]) / len(questions)
-                    if controls else 0.0)
-        log["noop_baseline"] = baseline
+                log["controls"] = evaluate_controls(answer, item, args, reward_fn)
+            # Controls are diagnostic only: NEVER filter questions or alter advantages.
         log["eligible_questions"] = len(questions)
+        log["question_ids"] = [str(q.get("question_id", "")) for q in questions]
+        mean_questions = sum(len(row["linked_questions"]) for row in tuples) / len(tuples)
+        args._tuple_question_weight = len(questions) / mean_questions
+        log["tuple_question_weight"] = args._tuple_question_weight
 
+        rollout_started = time.monotonic()
         trajectories = []
-        for _ in range(args.num_generations):
-            memory: list[dict[str, Any]] = []
+        for trajectory_index in range(args.num_generations):
+            memory: list[dict[str, Any]] = copy.deepcopy(item.get("initial_memory_bank", []))
             actions = []
             memory_states = []
             invalid_actions = 0
             for local_index, turn in enumerate(turns):
-                facts = [
-                    {
-                        "speaker": str(fact.get("speaker", turn.get("speaker", ""))),
-                        "timestamp": str(fact.get("timestamp", turn.get("timestamp", ""))),
-                        "key": str(fact.get("key", "")),
-                        "memory_type": str(fact.get("memory_type", "")),
-                        "tags": fact.get("tags", []),
-                        "text": str(fact.get("text", "")).strip(),
-                    }
-                    for fact in turn["facts"]
-                    if isinstance(fact, dict) and str(fact.get("text", "")).strip()
-                ]
+                facts = [dict(fact) for fact in turn["facts"]
+                         if isinstance(fact, dict) and str(fact.get("text", "")).strip()]
                 if not facts:
                     continue
                 query = " ".join(fact["text"] for fact in facts)
                 old_memory = retrieve(query, memory, args.manager_top_k)
                 prompt = build_manager_input(old_memory, facts)
+                append_progress(getattr(args, "progress_log", None), "turn_start",
+                                tuple_index=tuple_index, trajectory=trajectory_index, turn=local_index)
+                turn_started = time.monotonic()
                 completion, completion_ids = manager.generate(prompt, args.max_new_tokens, args.temperature)
                 with torch.no_grad():
                     old_token_log_probs = manager.log_probability(prompt, completion_ids).detach()
@@ -470,9 +388,12 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                     action["valid"] = False
                     invalid_actions += 1
                 memory_states.append(copy.deepcopy(memory))
+                append_progress(getattr(args, "progress_log", None), "turn_done",
+                                tuple_index=tuple_index, trajectory=trajectory_index, turn=local_index,
+                                valid=action["valid"], memory_size=len(memory),
+                                elapsed_seconds=round(time.monotonic() - turn_started, 3))
             trajectories.append(
                 {
-                    "noop_baseline": baseline,
                     "memory": memory,
                     "actions": actions,
                     "memory_states": memory_states,
@@ -480,75 +401,67 @@ def train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tu
                 }
             )
 
-        rewards: list[list[float]] = []
-        for trajectory in trajectories:
-            if not trajectory["actions"]:
-                rewards.append([0.0] * len(trajectory["actions"]))
-                continue
-
-            turn_rewards = [0.0] * len(trajectory["actions"])
-            for action_index, action in enumerate(trajectory["actions"]):
-                if not action["valid"]:
-                    turn_rewards[action_index] -= args.invalid_action_penalty
-            state_potentials = []
-            seen_turn_ids: set[str] = set()
-            for action_index, (state, action) in enumerate(zip(trajectory["memory_states"], trajectory["actions"])):
-                seen_turn_ids.update(
-                    turn["dia_id"]
-                    for turn in turns[: action["turn_position"] + 1]
-                )
-                next_potentials = [
-                    evidence_potential(
-                        question,
-                        state,
-                        args.answer_top_k,
-                        item["participants"],
-                        seen_turn_ids & evidence_ids(question),
-                    )
-                    for question in questions
-                ]
-                state_potentials.append(sum(next_potentials) / len(questions))
-            shaping = coverage_rewards(state_potentials, args.gamma,
-                                       getattr(args, "shaping_mode", "dense"),
-                                       getattr(args, "terminal_potential", "observed"))
-            trajectory["potentials"] = state_potentials
-            trajectory["shaping"] = shaping
-            for action_index, delta in enumerate(shaping):
-                turn_rewards[action_index] += args.evidence_weight * delta
-
-            question_rewards = []
-            trajectory["answers"] = []
-            for question in questions:
-                retrieved = retrieve_per_speaker(
-                    question["question"],
-                    trajectory["memory"],
-                    item["participants"],
-                    args.answer_top_k,
-                )
-                if hasattr(answer, "tokenizer"):
-                    try:
+        rollout_seconds = time.monotonic() - rollout_started
+        answer_started = time.monotonic()
+        # [question][trajectory][action]: retain the question axis through
+        # shaping, return computation, normalization and clipped losses.
+        question_rewards = [[] for _ in questions]
+        for trajectory_index, trajectory in enumerate(trajectories):
+            trajectory["question_records"] = []
+            for q_index, question in enumerate(questions):
+                qa_started = time.monotonic()
+                append_progress(getattr(args, "progress_log", None), "answer_start",
+                                tuple_index=tuple_index, trajectory=trajectory_index,
+                                question_index=q_index, question_id=str(question.get("question_id", "")))
+                actions = trajectory["actions"]
+                potentials = []
+                for state, action in zip(trajectory["memory_states"], actions):
+                    seen = {t["dia_id"] for t in turns[:action["turn_position"] + 1]}
+                    potentials.append(evidence_potential(
+                        question, state, args.answer_top_k, item["participants"], seen))
+                shaping = coverage_rewards(potentials, args.gamma,
+                    getattr(args, "shaping_mode", "dense"), getattr(args, "terminal_potential", "observed"))
+                row_rewards = [args.evidence_weight * value for value in shaping]
+                # One invalid action is exactly baseline's invalid candidate:
+                # zero score, no Answer call. Longer trajectories still need
+                # terminal QA for their earlier valid actions.
+                score, result = 0.0, {"status": "invalid_single_step", "prediction": ""}
+                if actions and any(a.get("valid", True) for a in actions):
+                    retrieved = retrieve_per_speaker(question["question"], trajectory["memory"],
+                                                    item["participants"], args.answer_top_k)
+                    if hasattr(answer, "tokenizer"):
                         result = safe_answer(answer, question["question"], retrieved, item["participants"],
-                                             args.answer_max_new_tokens, getattr(args, "context_overflow", "compress"),
-                                             getattr(args, "compression_tokens", 256))
-                    except ContextBudgetError as exc:
-                        # Do not turn a decoder/input failure into a negative Manager reward.
-                        log.update(event="aborted_group", error=str(exc), calls=exc.calls,
-                                   question_id=str(question.get("question_id", "")))
-                        append_jsonl(getattr(args, "group_log", None), log)
-                        raise
-                else:
-                    result = {"prediction": answer_with_model(answer, question["question"], retrieved,
-                              item["participants"], args.answer_max_new_tokens, args.answer_temperature)}
-                score = reward_fn(result["prediction"], gold_text(question["answer"]))
-                question_rewards.append(score)
-                trajectory["answers"].append(dict(result, question_id=str(question.get("question_id", "")),
-                                                    score=score))
-            turn_rewards[-1] += sum(question_rewards) / len(question_rewards)
-            rewards.append(turn_rewards)
-
+                            args.answer_max_new_tokens, getattr(args, "context_overflow", "truncate"),
+                            getattr(args, "compression_tokens", 256))
+                    else:
+                        result = {"prediction": answer_with_model(answer, question["question"], retrieved,
+                                  item["participants"], args.answer_max_new_tokens, args.answer_temperature)}
+                    score = reward_fn(result["prediction"], gold_text(question["answer"]))
+                if row_rewards:
+                    row_rewards[-1] += score
+                question_rewards[q_index].append(row_rewards)
+                trajectory["question_records"].append({"question_id": str(question.get("question_id", "")),
+                    "potentials": potentials, "shaping": shaping, "qa_score": score,
+                    "answer": result, "rewards": row_rewards})
+                append_progress(getattr(args, "progress_log", None), "answer_done",
+                                tuple_index=tuple_index, trajectory=trajectory_index,
+                                question_index=q_index, score=score,
+                                elapsed_seconds=round(time.monotonic() - qa_started, 3))
+        args._question_rewards = question_rewards
+        # Compatibility/log summary only. This mean NEVER enters credit assignment.
+        rewards = [[sum(question_rewards[q][i][t] for q in range(len(questions))) / len(questions)
+                    for t in range(len(tr["actions"]))] for i, tr in enumerate(trajectories)]
+        answer_seconds = time.monotonic() - answer_started
+        update_started = time.monotonic()
+        append_progress(getattr(args, "progress_log", None), "update_start", tuple_index=tuple_index)
         loss = apply_policy_update(manager, reference, optimizer, trajectories, rewards, args)
+        append_progress(getattr(args, "progress_log", None), "update_done", tuple_index=tuple_index,
+                        elapsed_seconds=round(time.monotonic() - update_started, 3),
+                        loss=None if math.isnan(loss) else loss)
+        log["timings"] = {"rollout_and_old_logprob_s": rollout_seconds, "answer_and_shaping_s": answer_seconds,
+                          "update_s": time.monotonic() - update_started}
         log["trajectories"] = [{"invalid_actions": tr["invalid_actions"],
-                                 "potentials": tr.get("potentials", []), "shaping": tr.get("shaping", []),
+                                 "question_records": tr.get("question_records", []),
                                  "answers": tr.get("answers", []), "rewards": reward}
                                 for tr, reward in zip(trajectories, rewards)]
         log["update"] = getattr(args, "_last_update", {})
@@ -574,20 +487,24 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("gamma must be in (0, 1].")
     if args.answer_temperature != 0:
         raise ValueError("The fixed Answer and all controls must use greedy decoding")
-    if args.advantage_estimator == "noop" and args.gamma != 1.0:
-        raise ValueError("Trajectory-noop baseline currently requires gamma=1")
-    if args.shaping_mode == "terminal" and (args.gamma != 1.0 or args.terminal_potential != "observed"):
-        raise ValueError("R3-T uses gamma=1 and observed coverage to match dense total coverage reward")
-    if args.adv_scale <= 0 or args.adv_clip <= 0 or args.variance_epsilon < 0:
-        raise ValueError("Require positive advantage scale/clip and nonnegative skip tolerance")
-    if args.control_gate == "threshold" and (args.control_threshold is None or not 0 <= args.control_threshold <= 1):
-        raise ValueError("Set --control-threshold in [0,1] using train precheck calibration")
+    if args.advantage_estimator != "grpo" or args.control_gate != "off":
+        raise ValueError("A/B/C protocol requires GRPO and diagnostic-only controls (gate off)")
+    if args.gamma != 1.0:
+        raise ValueError("A/B/C protocol fixes gamma=1")
+    if args.shaping_mode == "terminal" and args.terminal_potential != "observed":
+        raise ValueError("Terminal coverage ablation requires observed terminal potential")
+    if args.warmup_steps < 0 or args.weight_decay < 0 or args.variance_epsilon < 0:
+        raise ValueError("Optimizer/tolerance settings must be nonnegative")
     if args.checkpoint_every < 1 or args.compression_tokens < 1:
         raise ValueError("checkpoint-every and compression-tokens must be positive")
     set_seed(args.seed)
     validation = load_validation_timelines(args.validation_timelines) if args.validation_timelines else None
     rows = read_rows(args.data_path)
     tuples = normalize_tuples(rows)
+    if args.limit_tuples is not None:
+        if args.limit_tuples < 1:
+            raise ValueError("limit-tuples must be positive")
+        tuples = tuples[:args.limit_tuples]
     if not tuples:
         raise ValueError("No Manager training tuples were loaded.")
     if not getattr(args, "allow_nontrain_dialogues", False):
@@ -613,6 +530,8 @@ def train(args: argparse.Namespace) -> None:
                                            save_training_checkpoint, preserve_rng)
     if args.group_log is None:
         args.group_log = str(Path(args.output_dir) / "groups.jsonl")
+    if getattr(args, "progress_log", None) is None:
+        args.progress_log = str(Path(args.output_dir) / "training_progress.jsonl")
     if (Path(args.output_dir) / "run_manifest.json").exists() and not args.resume:
         raise ValueError("Output directory already contains a run; use --resume or a new output directory")
     manifest = write_run_metadata(args, write=False)
@@ -620,17 +539,36 @@ def train(args: argparse.Namespace) -> None:
     state = read_training_state(args.resume, contract) if args.resume else None
     if state and state["epoch"] >= args.epochs:
         raise ValueError("Resume has already completed the requested epoch count")
+    append_progress(args.progress_log, "model_load_start", component="manager",
+                    progress_log=str(Path(args.progress_log).resolve()),
+                    group_log=str(Path(args.group_log).resolve()))
     manager = TextModel(args.manager_model, args.device, trainable=True,
                         adapter_path=args.resume or args.manager_adapter, max_prompt_tokens=args.max_prompt_tokens)
-    reference = TextModel(args.manager_model, args.device, trainable=False,
-                          adapter_path=args.manager_adapter, max_prompt_tokens=args.max_prompt_tokens) if args.beta else None
+    append_progress(args.progress_log, "model_load_done", component="manager")
+    if args.manager_adapter:
+        raise ValueError("Main A/B/C runs initialize from the base model; use --resume for continuation")
+    if args.answer_adapter:
+        raise ValueError("Manager training uses frozen base Answer, not a trained Answer adapter")
+    reference = None  # disable_adapter() gives baseline's frozen reference
+    append_progress(args.progress_log, "model_load_start", component="answer")
     answer = TextModel(args.answer_model, args.device, trainable=False, adapter_path=args.answer_adapter,
                        max_prompt_tokens=args.max_prompt_tokens)
+    append_progress(args.progress_log, "model_load_done", component="answer")
     answer.context_overflow, answer.compression_tokens = args.context_overflow, args.compression_tokens
-    optimizer = torch.optim.AdamW(trainable_parameters(manager.model), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_parameters(manager.model), lr=args.learning_rate,
+                                 weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda step: min((step + 1) / max(args.warmup_steps, 1), 1.0))
+    args._scheduler = scheduler
     write_run_metadata(args)
+    run_started = time.monotonic()
+    append_progress(args.progress_log, "start", total_tuples=len(tuples), epochs=args.epochs,
+                    reward=args.reward, estimator=args.advantage_estimator,
+                    shaping_mode=args.shaping_mode)
     reward_fn = exact_match_reward if args.reward == "em" else answer_reward
     def validate(epoch):
+        started = time.monotonic()
+        append_progress(args.progress_log, "validation_start", epoch=epoch, dialogues=len(validation))
         result = evaluate_roll_forward(
             validation,
             lambda prompt: manager.generate(prompt, args.max_new_tokens, 0.0)[0],
@@ -639,15 +577,19 @@ def train(args: argparse.Namespace) -> None:
                 args.context_overflow, args.compression_tokens
             ),
             args, normalize_text, exact_match_reward, answer_reward,
+            progress=lambda event, **fields: append_progress(args.progress_log, event, epoch=epoch, **fields),
         )
         (Path(args.output_dir) / f"validation_epoch_{epoch}.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        print(f"validation epoch={epoch}: {result['summary']}")
-        return result["summary"]["reward_f1_unique_overlap"]
+        append_progress(args.progress_log, "validation_done", epoch=epoch,
+                        elapsed_seconds=round(time.monotonic() - started, 3), summary=result["summary"])
+        return result["summary"]
 
     if state:
         optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        args._epoch_stats = state.get("epoch_stats") or {"questions": 0, "signal_questions": 0}
         restore_rng(state["rng"])
         start_epoch, next_tuple, best = state["epoch"], state["next_tuple"], state["best"]
         # Deduplicate by (epoch, tuple_index), respecting explicit resume events.
@@ -655,9 +597,12 @@ def train(args: argparse.Namespace) -> None:
                                       "next_tuple": next_tuple, "checkpoint": args.resume})
     else:
         with preserve_rng():
-            initial_f1 = validate(0) if validation else None
+            initial = validate(0) if validation else None
         start_epoch, next_tuple = 0, 0
-        best = {"epoch": 0, "adapter": args.manager_adapter, "reward_f1_unique_overlap": initial_f1}
+        best = {"epoch": 0, "adapter": None,
+                "reward_f1_unique_overlap": initial["f1"] if initial else None,
+                "em": initial["em"] if initial else None,
+                "initial_validation_f1": initial["f1"] if initial else None}
     def write_best():
         (Path(args.output_dir) / "best_checkpoint.json").write_text(
             json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -667,23 +612,44 @@ def train(args: argparse.Namespace) -> None:
         def checkpoint_group(cursor):
             if cursor % args.checkpoint_every == 0 and cursor < len(tuples):
                 save_training_checkpoint(manager, optimizer,
-                    Path(args.output_dir) / f"epoch_{epoch}_tuple_{cursor}", epoch, cursor, best, contract)
+                    Path(args.output_dir) / f"epoch_{epoch}_tuple_{cursor}", epoch, cursor, best, contract,
+                    scheduler=scheduler, epoch_stats=args._epoch_stats)
         train_from_tuples(args, manager, reference, answer, optimizer, reward_fn, tuples,
                           start_index=next_tuple, on_group_end=checkpoint_group)
         next_tuple = 0
+        stop_training = False
         if validation:
             with preserve_rng():
-                f1 = validate(epoch + 1)
-            if f1 > best["reward_f1_unique_overlap"]:
-                best = {"epoch": epoch + 1, "adapter": str(Path(args.output_dir).resolve() / f"epoch_{epoch + 1}"),
-                        "reward_f1_unique_overlap": f1}
+                metric = validate(epoch + 1)
+            signal_ratio = args._epoch_stats["signal_questions"] / max(args._epoch_stats["questions"], 1)
+            stop_training = epoch == 0 and (
+                signal_ratio < args.epoch1_min_signal_ratio or metric["f1"] < best["initial_validation_f1"])
+            if not stop_training and (metric["f1"] > best["reward_f1_unique_overlap"] or
+                (metric["f1"] == best["reward_f1_unique_overlap"] and
+                 (metric["em"] > best["em"] or best["epoch"] == 0))):
+                best = dict(best, epoch=epoch + 1,
+                            adapter=str(Path(args.output_dir).resolve() / f"epoch_{epoch + 1}"),
+                            reward_f1_unique_overlap=metric["f1"], em=metric["em"])
+            if stop_training:
+                (Path(args.output_dir) / "stopped_early.json").write_text(json.dumps({
+                    "epoch": epoch + 1, "reason": "epoch_1_acceptance_gate", "signal_ratio": signal_ratio,
+                    "required_signal_ratio": args.epoch1_min_signal_ratio, "validation": metric}), encoding="utf-8")
         save_training_checkpoint(manager, optimizer, Path(args.output_dir) / f"epoch_{epoch + 1}",
-                                 epoch + 1, 0, best, contract)
+                                 epoch + 1, 0, best, contract, scheduler=scheduler, epoch_stats=args._epoch_stats)
         write_best()
+        append_progress(args.progress_log, "epoch_done", epoch=epoch + 1,
+                        total_tuples=len(tuples),
+                        elapsed_seconds=round(time.monotonic() - run_started, 3),
+                        best_reward=best.get("reward_f1_unique_overlap"))
+        if stop_training:
+            break
+    append_progress(args.progress_log, "done", epochs=args.epochs,
+                    elapsed_seconds=round(time.monotonic() - run_started, 3),
+                    best_reward=best.get("reward_f1_unique_overlap"))
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Algorithm 5: train Memory-R1 Memory Manager.")
+    parser = argparse.ArgumentParser(description="Controlled fullprefix Manager training (B/C).")
     parser.add_argument("--data-path", required=True, help="Algorithm 1 tuples (build_manager_training_data.py output)")
     parser.add_argument("--manager-model", required=True)
     parser.add_argument("--answer-model", required=True)
@@ -695,15 +661,20 @@ def build_parser():
         help="Explicitly allow a custom/non-LoCoMo training split; never use for a LoCoMo test claim.",
     )
     parser.add_argument("--output-dir", default="output/memory_r1_manager")
-    parser.add_argument("--algorithm", choices=["grpo", "ppo"], default="grpo")
+    parser.add_argument("--algorithm", choices=["grpo"], default="grpo")
     parser.add_argument("--reward", choices=["em", "f1"], default="f1", help="Reward on the frozen answer agent's output; defaults to baseline-lora F1. The paper uses EM.")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--epoch1-min-signal-ratio", type=float, default=0.15)
+    parser.add_argument("--limit-tuples", type=int, help="Explicit smoke run only; records subset in manifest")
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.02)
+    parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--manager-top-k", type=int, default=5)
     parser.add_argument("--answer-top-k", type=int, default=30, help="Retrieved memories per speaker, matching Answer tuple construction.")
@@ -712,15 +683,9 @@ def build_parser():
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--answer-temperature", type=float, default=0.0)
     parser.add_argument(
-        "--invalid-action-penalty",
-        type=float,
-        default=0.1,
-        help="Per-action penalty for malformed or invalid actions; invalid updates are atomic no-ops.",
-    )
-    parser.add_argument(
         "--variance-epsilon",
         type=float,
-        default=1e-6,
+        default=1e-12,
         help="Skip a turn-position group when its return standard deviation is at or below this value.",
     )
     parser.add_argument(
@@ -739,17 +704,15 @@ def build_parser():
         default=0.5,
         help="Weight of evidence-aware per-turn potential shaping.",
     )
-    parser.add_argument("--manager-adapter", help="Shared initial Manager adapter (also initializes KL reference)")
-    parser.add_argument("--advantage-estimator", choices=["grpo", "noop"], default="noop")
-    parser.add_argument("--adv-scale", type=float, default=1.0)
-    parser.add_argument("--adv-clip", type=float, default=5.0)
-    parser.add_argument("--control-gate", choices=["off", "threshold"], default="threshold")
-    parser.add_argument("--control-threshold", type=float, help="Calibrate on train precheck; no validated default")
+    parser.add_argument("--manager-adapter", help="Reserved for separate experiments; main A/B/C rejects this option")
+    parser.add_argument("--advantage-estimator", choices=["grpo"], default="grpo")
+    parser.add_argument("--control-gate", choices=["off"], default="off")
     parser.add_argument("--control-diagnostics", action="store_true", help="Also run controls for ungated GRPO")
-    parser.add_argument("--context-overflow", choices=["compress", "error"], default="compress")
+    parser.add_argument("--context-overflow", choices=["truncate", "compress", "error"], default="truncate")
     parser.add_argument("--compression-tokens", type=int, default=256)
     parser.add_argument("--shaping-mode", choices=["dense", "terminal"], default="dense")
     parser.add_argument("--group-log", help="JSONL group audit log; defaults to output-dir/groups.jsonl")
+    parser.add_argument("--progress-log", help="Flushed JSONL progress log; defaults to output-dir/training_progress.jsonl")
     parser.add_argument("--resume", help="Trusted local checkpoint directory including training_state.pt")
     parser.add_argument("--checkpoint-every", type=int, default=50, help="Save optimizer/RNG/cursor every N groups")
     return parser

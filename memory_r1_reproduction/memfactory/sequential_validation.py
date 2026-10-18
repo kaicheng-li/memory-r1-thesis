@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
+from time import monotonic
 from evaluation.metrics import bleu1_score
 
 from memfactory.locomo_split import SPLIT_DIALOGUE_IDS
@@ -33,7 +34,8 @@ def load_validation_timelines(path: str) -> list[dict]:
     return timelines
 
 
-def evaluate_roll_forward(timelines, manager_generate, answer_generate, args, normalize, em, reward_f1):
+def evaluate_roll_forward(timelines, manager_generate, answer_generate, args, normalize, em, reward_f1,
+                          progress=None):
     """Build each full bank once, then answer every QA greedily.
 
     No evidence annotations are consumed. This follows full-dialogue QA,
@@ -42,11 +44,16 @@ def evaluate_roll_forward(timelines, manager_generate, answer_generate, args, no
     records, dialogues = [], []
     for timeline in timelines:
         bank, invalid, attempted = [], 0, 0
-        for turn in timeline["turns"]:
+        for index, turn in enumerate(timeline["turns"], 1):
             facts = [fact for fact in turn["facts"]
                      if isinstance(fact, dict) and str(fact.get("text", "")).strip()]
             if not facts:
                 continue
+            started = monotonic()
+            context = dict(dialogue_id=timeline["dialogue_id"], turn=index,
+                           total_turns=len(timeline["turns"]), source_turn=turn.get("turn_index"))
+            if progress:
+                progress("validation_turn_start", **context, memory_size=len(bank))
             visible = retrieve(" ".join(str(fact["text"]) for fact in facts), bank, args.manager_top_k)
             raw = manager_generate(build_manager_input(visible, facts))
             attempted += 1
@@ -55,9 +62,17 @@ def evaluate_roll_forward(timelines, manager_generate, answer_generate, args, no
                                 visible_memory_ids={item["id"] for item in visible})
             except (ValueError, KeyError, TypeError):
                 invalid += 1
-        for question in timeline["questions"]:
+            if progress:
+                progress("validation_turn_done", **context, memory_size=len(bank), invalid_actions=invalid,
+                         elapsed_seconds=round(monotonic() - started, 3))
+        for index, question in enumerate(timeline["questions"], 1):
             if int(question.get("category", 0)) not in {1, 2, 3, 4}:
                 continue
+            started = monotonic()
+            context = dict(dialogue_id=timeline["dialogue_id"], question_index=index,
+                           total_questions=len(timeline["questions"]), question_id=str(question["question_id"]))
+            if progress:
+                progress("validation_answer_start", **context)
             gold = question["answer"]
             if isinstance(gold, list):
                 gold = ", ".join(str(value) for value in gold)
@@ -72,6 +87,9 @@ def evaluate_roll_forward(timelines, manager_generate, answer_generate, args, no
                 "em": em(prediction, gold), "token_f1_multiset": multiset_f1(prediction, gold, normalize),
                 "reward_f1_unique_overlap": reward_f1(prediction, gold),
             })
+            if progress:
+                progress("validation_answer_done", **context, f1=records[-1]["f1"], em=records[-1]["em"],
+                         elapsed_seconds=round(monotonic() - started, 3))
         dialogues.append({"dialogue_id": timeline["dialogue_id"], "invalid_actions": invalid,
                           "attempted_actions": attempted, "memory_size": len(bank), "turns": len(timeline["turns"])})
     if not records:

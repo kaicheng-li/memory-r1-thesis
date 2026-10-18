@@ -246,7 +246,7 @@ def main() -> None:
     parser.add_argument("--max-prompt-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
-    parser.add_argument("--context-overflow", choices=["compress", "error"], default="compress")
+    parser.add_argument("--context-overflow", choices=["truncate", "compress", "error"], default="truncate")
     parser.add_argument("--compression-tokens", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force", action="store_true")

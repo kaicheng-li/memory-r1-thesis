@@ -119,7 +119,7 @@ class ManagerRuntimeTests(unittest.TestCase):
         self.assertNotIn("source_turn_ids", manager_prompt)
         self.assertNotIn("D1:7", manager_prompt)
 
-    def test_answer_rows_replay_manager_tuple_window(self):
+    def test_answer_rows_use_full_dialogue_bank(self):
         class Manager:
             def generate(self, _bank, facts, _top_k):
                 text = facts[0]["text"]
@@ -144,13 +144,19 @@ class ManagerRuntimeTests(unittest.TestCase):
                 "evidence": ["D1:2"],
             }],
         }
-        rows = build_rows([tuple_row], Manager(), 5, 30, "train", "base-model")
+        timeline = dict(tuple_row, turns=tuple_row["dialogue_turns"], questions=tuple_row["linked_questions"])
+        # A later fact after the question's evidence target must still be in
+        # the full-dialogue Answer bank (baseline downstream protocol).
+        timeline["turns"] = timeline["turns"] + [{"turn_index": 2, "dia_id": "D1:3", "speaker": "Ada",
+            "timestamp": "t3", "facts": [{"text": "Ada later moved to Rome"}]}]
+        rows = build_rows([timeline], Manager(), 5, 30, "train", "base-model")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["question_id"], "9")
         self.assertEqual(rows[0]["participants"], ["Ada", "Bob"])
         self.assertEqual(rows[0]["retrieved_memories"][0]["source_turn_ids"], ["D1:2"])
-        self.assertEqual(rows[0]["metadata"]["window_turns"], 1)
-        self.assertEqual(rows[0]["metadata"]["source"], "manager_tuple_window_replay_v1")
+        self.assertEqual(rows[0]["metadata"]["turns"], 2)
+        self.assertEqual(len(rows[0]["retrieved_memories"]), 2)
+        self.assertEqual(rows[0]["metadata"]["source"], "full_dialogue_cached_facts_greedy")
 
     def test_invalid_manager_action_keeps_prior_bank_and_reward_alignment(self):
         class Manager:
@@ -200,8 +206,12 @@ class ManagerRuntimeTests(unittest.TestCase):
             self.assertEqual(len(trajectory["actions"]), len(trajectory["memory_states"]))
             self.assertEqual([action["valid"] for action in trajectory["actions"]], [True, False])
             self.assertEqual(trajectory["memory_states"][1], trajectory["memory_states"][0])
-            self.assertAlmostEqual(sum(reward), 1.4)
-            self.assertAlmostEqual(reward[1], 0.9)
+            self.assertAlmostEqual(sum(reward), 1.5)
+            self.assertAlmostEqual(reward[1], 1.0)
+            from memfactory.sequential_credit import question_credit
+            _, groups = question_credit(trajectories, [rewards])
+            self.assertEqual(groups[1]["returns"], [0.0, 0.0])
+            self.assertEqual(groups[0]["returns"], [1.5, 1.5])
 
 
 class ZeroVarianceTests(unittest.TestCase):
@@ -316,18 +326,24 @@ class CompletionTruncationTests(unittest.TestCase):
             def __call__(self, *_args, **_kwargs):
                 return {"input_ids": torch.tensor([[4, 5]])}
 
-        class PositionModel(torch.nn.Module):
+        class Decoder(torch.nn.Module):
             def forward(self, input_ids, attention_mask, position_ids, **_kwargs):
                 self.positions = position_ids
-                logits = torch.zeros((*input_ids.shape, 10))
-                return SimpleNamespace(logits=logits)
+                return SimpleNamespace(last_hidden_state=torch.zeros((*input_ids.shape, 4)))
+
+        class PositionModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Decoder()
+                self.lm_head = torch.nn.Linear(4, 10)
 
         model = PositionModel()
         _, mask = score_group(
-            model, Tokenizer(), "prompt", [torch.tensor([7, 2]), torch.tensor([8, 9, 2])], "cpu", 32
+            model, Tokenizer(), "prompt", [torch.tensor([7, 2]), torch.tensor([8, 9, 2])], "cpu", 2, 32
         )
-        self.assertEqual(model.positions.tolist(), [[0, 0, 1, 2, 3], [0, 1, 2, 3, 4]])
+        self.assertEqual(model.model.positions.tolist(), [[0, 0, 1, 2, 3], [0, 1, 2, 3, 4]])
         self.assertEqual(mask.sum(dim=1).tolist(), [2, 3])
+
 
 
 class ShapingBoundaryTests(unittest.TestCase):
@@ -427,19 +443,32 @@ class SequentialValidationTests(unittest.TestCase):
             for i in (1, 2)
         ], "questions": [{"question_id": "0", "question": "what?", "answer": "yes yes", "category": 1}]}
         outputs = iter(["malformed", '{"memory":[{"event":"ADD","text":"last turn"}]}'])
+        events = []
+
+        def manager(_prompt):
+            self.assertEqual(events[-1][0], "validation_turn_start")
+            return next(outputs)
 
         def answer(_question, memories, _participants):
+            self.assertEqual(events[-1][0], "validation_answer_start")
             self.assertEqual(memories[0]["text"], "last turn")
             return "yes yes extra"
 
         result = evaluate_roll_forward(
-            [timeline], lambda _: next(outputs), answer,
+            [timeline], manager, answer,
             SimpleNamespace(manager_top_k=5, answer_top_k=30),
             normalize_text, exact_match_reward, answer_reward,
+            progress=lambda event, **fields: events.append((event, fields)),
         )
         self.assertAlmostEqual(result["summary"]["token_f1_multiset"], 0.8)
         self.assertAlmostEqual(result["summary"]["reward_f1_unique_overlap"], 0.4)
         self.assertEqual(result["dialogues"][0]["invalid_actions"], 1)
+        self.assertEqual([event for event, _ in events], [
+            "validation_turn_start", "validation_turn_done",
+            "validation_turn_start", "validation_turn_done",
+            "validation_answer_start", "validation_answer_done",
+        ])
+        self.assertEqual(events[1][1]["invalid_actions"], 1)
 
 
 if __name__ == "__main__":

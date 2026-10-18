@@ -58,7 +58,7 @@ def parse_manager_output(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict) and isinstance(payload.get("memory"), list):
-            return payload["memory"]
+            return [item for item in payload["memory"] if isinstance(item, dict)]
     raise ValueError("Memory Manager output does not contain a valid memory JSON object.")
 
 
@@ -73,87 +73,24 @@ def next_memory_id(memory_bank: list[dict[str, Any]], dialogue_id: str) -> str:
     return f"{prefix}{max(indices, default=-1) + 1}"
 
 
-def apply_decisions(
-    memory_bank: list[dict[str, Any]],
-    decisions: list[dict[str, Any]],
-    dialogue_id: str,
-    turn: dict[str, Any],
-    *,
-    visible_memory_ids: set[str] | None = None,
-    max_actions: int = 5,
-) -> None:
-    """Validate and apply a Manager action list atomically.
+def apply_decisions(memory_bank, decisions, dialogue_id, turn, *, visible_memory_ids=None, max_actions=5):
+    """Baseline transition, with a private turn-origin ledger for coverage only.
 
-    The prompt exposes only a retrieved subset of the bank.  When that set is
-    supplied, UPDATE/DELETE/NONE may reference only those IDs.  All validation
-    happens before mutation, so a malformed later action cannot leave a partial
-    state behind.
+    The ledger is never shown to the policy. UPDATE retains previous origins;
+    it does not assert semantic support for the current turn.
     """
-    if not isinstance(decisions, list):
-        raise ValueError("memory must be a list")
-    mutating = sum(
-        1 for item in decisions
-        if isinstance(item, dict) and str(item.get("event", "")).upper() != "NONE"
-    )
-    if mutating > max_actions:
-        raise ValueError(f"more than {max_actions} mutating actions")
-
-    original = deepcopy(memory_bank)
-    by_id = {str(entry.get("id", "")): entry for entry in original}
-    visible_ids = (
-        {str(value) for value in visible_memory_ids}
-        if visible_memory_ids is not None
-        else set(by_id)
-    )
-    seen_targets: set[str] = set()
-    normalized: list[tuple[str, str, str]] = []
-    for index, decision in enumerate(decisions):
-        if not isinstance(decision, dict):
-            raise ValueError(f"action {index} is not an object")
-        event = str(decision.get("event", "")).upper()
-        if event not in {"ADD", "UPDATE", "DELETE", "NONE"}:
-            raise ValueError(f"unsupported event {event!r}")
-        memory_id = str(decision.get("id", ""))
-        text = str(decision.get("text", "")).strip()
-        if event == "ADD":
-            if not text:
-                raise ValueError("ADD requires non-empty text")
-        else:
-            if not memory_id or memory_id not in visible_ids or memory_id not in by_id:
-                raise ValueError(f"{event} id {memory_id!r} was not visible")
-            if memory_id in seen_targets:
-                raise ValueError(f"duplicate target id {memory_id!r}")
-            if event == "UPDATE" and not text:
-                raise ValueError("UPDATE requires non-empty text")
-            seen_targets.add(memory_id)
-        normalized.append((event, memory_id, text))
-
-    source_turn_id = str(turn.get("dia_id", ""))
-    bank = deepcopy(original)
-    by_id = {str(entry.get("id", "")): entry for entry in bank}
-    for event, memory_id, text in normalized:
-        if event == "NONE":
-            continue
-        if event == "ADD":
-            entry = {
-                "id": next_memory_id(bank, dialogue_id),
-                "text": text,
-                "speaker": turn.get("speaker", ""),
-                "timestamp": turn.get("timestamp", ""),
-                "source_turn_ids": [source_turn_id] if source_turn_id else [],
-            }
-            bank.append(entry)
-            by_id[entry["id"]] = entry
-        elif event == "UPDATE":
-            entry = by_id[memory_id]
-            entry["text"] = text
-            entry["timestamp"] = turn.get("timestamp", "")
-            prior_sources = [str(value) for value in entry.get("source_turn_ids", [])]
-            # An UPDATE can rewrite an old fact without containing any new
-            # evidence from this turn.  Preserve provenance; do not award the
-            # current turn merely because an UPDATE happened here.
-            entry["source_turn_ids"] = list(dict.fromkeys(prior_sources))
-        elif event == "DELETE":
-            entry = by_id.pop(memory_id)
-            bank.remove(entry)
-    memory_bank[:] = bank
+    from memfactory.manager_env import validate_and_apply
+    visible = memory_bank if visible_memory_ids is None else [
+        m for m in memory_bank if m["id"] in visible_memory_ids]
+    prior_ids = {m["id"] for m in memory_bank}
+    result = validate_and_apply(
+        memory_bank, visible, decisions, dialogue_id=dialogue_id,
+        source_turn=int(turn.get("turn_index", 0)), speaker=turn.get("speaker", ""),
+        timestamp=turn.get("timestamp", ""), max_actions=max_actions)
+    if not result.valid:
+        raise ValueError(result.error)
+    for entry in result.memory_bank:
+        if entry["id"] not in prior_ids:
+            origin = str(turn.get("dia_id", ""))
+            entry["source_turn_ids"] = [origin] if origin else []
+    memory_bank[:] = result.memory_bank
