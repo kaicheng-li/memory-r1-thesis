@@ -43,23 +43,38 @@ def retrieve_per_speaker(
 
 
 def parse_manager_output(text: str) -> list[dict[str, Any]]:
-    """Extract the first valid Manager JSON object from model output.
+    """Extract Manager JSON, allowing only a missing outer closing brace.
 
     A greedy ``first {``/``last }`` slice is vulnerable to explanations,
-    multiple JSON objects, and braces inside strings.  ``raw_decode`` lets us
-    try each possible object boundary without accepting a malformed prefix.
+    multiple JSON objects, and braces inside strings. Decode the entire memory
+    array before recovering its missing wrapper; never complete action content.
+    Once a broken Manager object is recognized, do not fall through to echoed
+    prompt examples later in the output.
     """
     decoder = json.JSONDecoder()
+    error = "Memory Manager output does not contain a valid memory JSON object."
     for start, character in enumerate(text):
         if character != "{":
             continue
         try:
             payload, _ = decoder.raw_decode(text[start:])
         except json.JSONDecodeError:
-            continue
+            prefix = re.match(r'\{\s*"memory"\s*:\s*', text[start:])
+            if prefix is None:
+                continue
+            try:
+                memory, end = decoder.raw_decode(text, start + prefix.end())
+            except json.JSONDecodeError:
+                raise ValueError(error) from None
+            tail = text[end:].lstrip()
+            # A complete list plus prose/markdown may lack just its wrapper.
+            # Structural continuations indicate a different syntax error.
+            if not isinstance(memory, list) or (tail and tail[0] in ',]}:"[{'):
+                raise ValueError(error)
+            payload = {"memory": memory}
         if isinstance(payload, dict) and isinstance(payload.get("memory"), list):
             return [item for item in payload["memory"] if isinstance(item, dict)]
-    raise ValueError("Memory Manager output does not contain a valid memory JSON object.")
+    raise ValueError(error)
 
 
 def next_memory_id(memory_bank: list[dict[str, Any]], dialogue_id: str) -> str:
